@@ -31,13 +31,7 @@ async def _get_client(phone, session):
         if existing and existing.is_connected:
             return existing
         # Evict if pool is full
-        if len(_client_pool) >= MAX_POOL and phone not in _client_pool:
-            old_phone, old_app = next(iter(_client_pool.items()))
-            try:
-                await old_app.stop()
-            except Exception:
-                pass
-            del _client_pool[old_phone]
+        
         app = Client(f"pool_{uuid.uuid4().hex[:6]}",
                      api_id=API_ID, api_hash=API_HASH,
                      session_string=session,
