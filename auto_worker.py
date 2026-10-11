@@ -1,4 +1,4 @@
-"""auto_worker.py — parallel reactions, VC worker per channel."""
+"""auto_worker.py — persistent client pool, parallel reactions, dead-account cleanup."""
 import asyncio, random, uuid, time, logging
 from datetime import datetime
 from pyrogram import Client
@@ -12,6 +12,53 @@ from vc_joiner import auto_vc_worker
 logger = logging.getLogger(__name__)
 _running_workers = {}
 _reaction_locks = {}
+
+# ── Persistent client pool ──────────────────────────
+_client_pool = {}
+_client_pool_lock = {}
+MAX_POOL = 200   # keep up to N clients hot
+DEAD_MARKERS = ("USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
+                "AUTH_KEY_UNREGISTERED", "USERNAME_NOT_OCCUPIED",
+                "PEER_ID_INVALID", "USER_ID_INVALID")
+
+
+async def _get_client(phone, session):
+    """Reuse existing client or create one and cache it."""
+    if phone not in _client_pool_lock:
+        _client_pool_lock[phone] = asyncio.Lock()
+    async with _client_pool_lock[phone]:
+        existing = _client_pool.get(phone)
+        if existing and existing.is_connected:
+            return existing
+        # Evict if pool is full
+        if len(_client_pool) >= MAX_POOL and phone not in _client_pool:
+            old_phone, old_app = next(iter(_client_pool.items()))
+            try:
+                await old_app.stop()
+            except Exception:
+                pass
+            del _client_pool[old_phone]
+        app = Client(f"pool_{uuid.uuid4().hex[:6]}",
+                     api_id=API_ID, api_hash=API_HASH,
+                     session_string=session,
+                     in_memory=True, no_updates=True)
+        await app.start()
+        _client_pool[phone] = app
+        return app
+
+
+async def _drop_dead(phone, err=""):
+    from database import accounts
+    try:
+        await accounts.delete_one({"phone": phone})
+    except Exception:
+        pass
+    # Also evict client
+    app = _client_pool.pop(phone, None)
+    if app:
+        try: await app.stop()
+        except Exception: pass
+    logger.warning(f"🗑 Dropped dead account {phone} — {err[:80]}")
 
 
 def _get_lock(cid, mid):
@@ -46,16 +93,16 @@ async def _react_and_view(app, peer, mid, emoji, cid):
 
 
 async def _react_one_account(acc, chat_target, cid, new_ids, reactions):
-    app = None
+    phone = acc.get("phone")
     try:
-        app = Client(f"rv_{uuid.uuid4().hex[:6]}",
-                     api_id=API_ID, api_hash=API_HASH,
-                     session_string=acc["session"],
-                     in_memory=True, no_updates=True)
-        await app.start()
+        app = await _get_client(phone, acc["session"])
         try:
             peer = await app.resolve_peer(cid)
-        except Exception:
+        except Exception as e:
+            err = str(e)
+            if any(m in err for m in DEAD_MARKERS):
+                await _drop_dead(phone, err)
+                return False
             try:
                 await app.join_chat(chat_target)
             except UserAlreadyParticipant:
@@ -64,18 +111,19 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions):
                 pass
             chat = await app.get_chat(chat_target)
             peer = await app.resolve_peer(chat.id)
+
         for mid in new_ids:
             await _react_and_view(app, peer, mid, random.choice(reactions), cid)
         return True
     except Exception as e:
-        logger.debug(f"react err {acc.get('phone')}: {e}")
+        err = str(e)
+        if any(m in err for m in DEAD_MARKERS):
+            await _drop_dead(phone, err)
+        else:
+            logger.debug(f"react err {phone}: {err}")
+        # Evict broken client
+        _client_pool.pop(phone, None)
         return False
-    finally:
-        if app:
-            try:
-                await app.stop()
-            except Exception:
-                pass
 
 
 async def process_channel(ch_doc):
@@ -178,3 +226,7 @@ async def stop_all():
     for t in _running_workers.values():
         t.cancel()
     _running_workers.clear()
+    for app in _client_pool.values():
+        try: await app.stop()
+        except Exception: pass
+    _client_pool.clear()
