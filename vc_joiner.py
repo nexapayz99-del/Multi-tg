@@ -1,4 +1,4 @@
-"""vc_joiner.py — no GroupcallForbidden anywhere."""
+"""vc_joiner.py — final, no GroupcallForbidden, drops dead accounts."""
 import asyncio, uuid, os, wave, logging
 from pyrogram import Client
 from pyrogram.raw import functions
@@ -20,6 +20,9 @@ except Exception as e:
 
 _active_sessions = {}
 _stop_events = {}
+DEAD_MARKERS = ("USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
+                "AUTH_KEY_UNREGISTERED", "USERNAME_NOT_OCCUPIED",
+                "PEER_ID_INVALID", "USER_ID_INVALID")
 
 
 def ensure_silent():
@@ -80,6 +83,15 @@ async def _play_muted(call_py, chat_id, media_path):
         return False
 
 
+async def _drop_dead(phone, err=""):
+    from database import accounts
+    try:
+        await accounts.delete_one({"phone": phone})
+        logger.warning(f"🗑 Dropped dead account {phone} — {err[:80]}")
+    except Exception:
+        pass
+
+
 async def _join_one(phone, session, chat_target):
     app = None
     try:
@@ -90,12 +102,21 @@ async def _join_one(phone, session, chat_target):
         await app.start()
         try:
             chat = await app.get_chat(chat_target)
-        except Exception:
+        except Exception as e:
+            err = str(e)
+            if any(m in err for m in DEAD_MARKERS):
+                await _drop_dead(phone, err)
+                await app.stop()
+                return None
             try:
                 await app.join_chat(chat_target)
                 chat = await app.get_chat(chat_target)
-            except Exception as e:
-                logger.warning(f"VC {phone}: resolve fail {e}")
+            except Exception as e2:
+                err2 = str(e2)
+                if any(m in err2 for m in DEAD_MARKERS):
+                    await _drop_dead(phone, err2)
+                else:
+                    logger.warning(f"VC {phone}: resolve fail {err2}")
                 await app.stop()
                 return None
         call_py = PyTgCalls(app)
@@ -111,7 +132,11 @@ async def _join_one(phone, session, chat_target):
         logger.info(f"🎤 {phone} joined VC: {_active_sessions[phone]['title']}")
         return chat.id
     except Exception as e:
-        logger.error(f"VC join {phone}: {e}")
+        err = str(e)
+        if any(m in err for m in DEAD_MARKERS):
+            await _drop_dead(phone, err)
+        else:
+            logger.error(f"VC join {phone}: {err}")
         if app:
             try: await app.stop()
             except Exception: pass
@@ -159,7 +184,10 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                     live = await is_vc_live(pc, chat.id)
                     logger.info(f"🎤 probe {chat_target}: live={live}")
             except Exception as e:
-                logger.warning(f"probe failed: {e}")
+                err = str(e)
+                if any(m in err for m in DEAD_MARKERS):
+                    await _drop_dead(probe["phone"], err)
+                logger.warning(f"probe failed: {err}")
             if live and not joined:
                 logger.info(f"🎤 VC LIVE — joining {len(accs)} accounts")
                 for acc in accs:
