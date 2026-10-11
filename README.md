@@ -11,7 +11,7 @@ Multi-account Telegram automation:
 
 ## Quick Start
 ```bash
-git clone https://github.com/nexapayz99-del/Multi-tg/edit/main/.env
+git clone https://github.com/nexapayz99-del/Multi-tg
 cd tg-multi-manager
 cp .env.example .env
 # fill .env
