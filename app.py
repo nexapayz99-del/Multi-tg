@@ -1,4 +1,4 @@
-import asyncio, logging, uuid
+import asyncio, logging
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -59,9 +59,9 @@ async def _start(c, m):
         reply_markup=main_menu(uid))
 
 
-# ─────────────────────────────────────────────────────────────
-# BUTTON HANDLERS — direct, no indirection
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# BUTTONS
+# ─────────────────────────────────────────────────────────
 @bot.on_message(filters.private & filters.regex("^📱 Add Account$"))
 async def _btn_addacc(c, m):
     from handlers.accounts import _addacc_impl
@@ -85,7 +85,7 @@ async def _btn_randomize(c, m):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
     c.user_data[uid] = {"step": "randomizer_zip"}
-    await m.reply("🎭 Send ZIP with names.txt + photos/ (or pairs.json)")
+    await m.reply("🎭 Send ZIP with names.txt + photos/ or pairs.json")
 
 
 @bot.on_message(filters.private & filters.regex("^📋 My Accounts$"))
@@ -95,12 +95,12 @@ async def _btn_myaccts(c, m):
     mine = [a for a in accs
             if a.get("added_by") == uid or uid == OWNER_ID]
     if not mine:
-        return await m.reply("📋 You have no accounts yet.\n\nUse 📱 Add Account")
+        return await m.reply("📋 No accounts yet.\n\nUse 📱 Add Account")
     kb = []
     for a in mine[:50]:
         kb.append([InlineKeyboardButton(
-            f"⚙️ {a.get('name', '?')} | {a.get('phone', '?')}",
-            callback_data=f"acct_{a.get('phone', '')}")])
+            f"⚙️ {a.get('name','?')} | {a.get('phone','?')}",
+            callback_data=f"acct_{a.get('phone','')}")])
     await m.reply(f"📋 **Your Accounts** ({len(mine)})\n\nTap to manage:",
                   reply_markup=InlineKeyboardMarkup(kb))
 
@@ -116,8 +116,7 @@ async def _btn_addchan(c, m):
     c.user_data = getattr(c, "user_data", {})
     c.user_data[uid] = {"step": "channel_link"}
     await m.reply(
-        "📺 Send the channel link.\n"
-        "Accepted:\n"
+        "📺 Send the channel link:\n"
         "• `@username`\n"
         "• `https://t.me/username`\n"
         "• `https://t.me/+invite`")
@@ -150,7 +149,7 @@ async def _btn_joinvc(c, m):
     await m.reply(
         "🎤 Send the channel link where VC is LIVE:\n\n"
         "Example: `@unfindmusic`\n\n"
-        "All your accounts will join the VC (mic muted).")
+        "All valid accounts will join (unmuted).")
 
 
 @bot.on_message(filters.private & filters.regex("^🚪 Leave VC$"))
@@ -171,9 +170,9 @@ async def _btn_joinlink(c, m):
     c.user_data = getattr(c, "user_data", {})
     c.user_data[uid] = {"step": "joinlink_input"}
     await m.reply(
-        "🔗 Send the group/channel link for accounts to JOIN:\n\n"
-        "• Public: `@username` or `https://t.me/username`\n"
-        "• Private: `https://t.me/+invitehash`")
+        "🔗 Send the group/channel link:\n"
+        "• Public: `@username`\n"
+        "• Private: `https://t.me/+hash`")
 
 
 @bot.on_message(filters.private & filters.regex("^🚪 Leave Link$"))
@@ -228,6 +227,7 @@ async def _do_owner_panel(c, m):
 
 async def _do_health(c, m):
     from config import API_ID, API_HASH
+    import uuid
     s = await m.reply("🩺 Health check...")
     accs = await all_accounts()
     ok = dead = 0
@@ -245,9 +245,9 @@ async def _do_health(c, m):
     await s.edit_text(f"🏁 Alive: `{ok}` | 💀 Removed: `{dead}`")
 
 
-# ─────────────────────────────────────────────────────────────
-# Text-input states
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# TEXT INPUT HANDLERS FOR VC / LINK
+# ─────────────────────────────────────────────────────────
 @bot.on_message(filters.private & filters.text, group=5)
 async def _text_states(c, m):
     ud = getattr(c, "user_data", {})
@@ -261,37 +261,20 @@ async def _text_states(c, m):
 
     if step == "joinvc_link":
         ud.pop(m.from_user.id, None)
-        from vc_joiner import _join_one, ensure_silent
-        ensure_silent()
-        s = await m.reply(f"🎤 Joining VC `{txt}` with all accounts...")
-        accs = await all_accounts()
-        accs = [a for a in accs if a.get("session")]
-        if not accs:
-            return await s.edit_text("❌ No accounts in DB.")
-        joined = failed = 0
-        for i, acc in enumerate(accs):
-            cid = await _join_one(acc["phone"], acc["session"], txt)
-            if cid:
-                joined += 1
-            else:
-                failed += 1
-            try:
-                await s.edit_text(
-                    f"🎤 **Joining VC** `{txt}`\n"
-                    f"✅ `{joined}` ❌ `{failed}` ({i+1}/{len(accs)})")
-            except Exception:
-                pass
-            await asyncio.sleep(7)
-        return await s.edit_text(
-            f"🏁 **VC Join Complete**\n✅ `{joined}` ❌ `{failed}`")
+        from handlers.engagement import _safe_join_vc
+        await _safe_join_vc(m, txt)
+        return
 
     if step == "joinlink_input":
         ud.pop(m.from_user.id, None)
         s = await m.reply(f"🔗 Joining `{txt}` with all accounts...")
+        import base64, uuid
+        from handlers.engagement import _is_valid_session
         accs = await all_accounts()
-        accs = [a for a in accs if a.get("session")]
+        accs = [a for a in accs
+                if a.get("session") and _is_valid_session(a["session"])]
         if not accs:
-            return await s.edit_text("❌ No accounts.")
+            return await s.edit_text("❌ No valid sessions.")
         ok = fail = already = 0
         for i, acc in enumerate(accs):
             app = None
@@ -302,8 +285,7 @@ async def _text_states(c, m):
                              in_memory=True, no_updates=True)
                 await app.start()
                 try:
-                    await app.join_chat(txt)
-                    ok += 1
+                    await app.join_chat(txt); ok += 1
                 except Exception as e:
                     em = str(e).lower()
                     if "already" in em:
@@ -314,27 +296,27 @@ async def _text_states(c, m):
                 fail += 1
             finally:
                 if app:
-                    try:
-                        await app.stop()
-                    except Exception:
-                        pass
-            try:
-                await s.edit_text(
-                    f"🔗 `{ok}` ✅ | `{already}` ⏭ | `{fail}` ❌ "
-                    f"({i+1}/{len(accs)})")
-            except Exception:
-                pass
-            await asyncio.sleep(2.5)
+                    try: await app.stop()
+                    except Exception: pass
+            if i % 5 == 0 or i == len(accs) - 1:
+                try:
+                    await s.edit_text(
+                        f"🔗 `{ok}` ✅ | `{already}` ⏭ | `{fail}` ❌ "
+                        f"({i+1}/{len(accs)})")
+                except Exception: pass
         return await s.edit_text(
             f"🏁 **Join Complete**\n✅ `{ok}`\n⏭ `{already}`\n❌ `{fail}`")
 
     if step == "leavelink_input":
         ud.pop(m.from_user.id, None)
         s = await m.reply(f"🚪 Leaving `{txt}`...")
+        import uuid
+        from handlers.engagement import _is_valid_session
         accs = await all_accounts()
-        accs = [a for a in accs if a.get("session")]
+        accs = [a for a in accs
+                if a.get("session") and _is_valid_session(a["session"])]
         if not accs:
-            return await s.edit_text("❌ No accounts.")
+            return await s.edit_text("❌ No valid sessions.")
         ok = fail = 0
         for i, acc in enumerate(accs):
             app = None
@@ -346,41 +328,37 @@ async def _text_states(c, m):
                 await app.start()
                 try:
                     chat = await app.get_chat(txt)
-                    await app.leave_chat(chat.id)
-                    ok += 1
+                    await app.leave_chat(chat.id); ok += 1
                 except Exception:
                     fail += 1
             except Exception:
                 fail += 1
             finally:
                 if app:
-                    try:
-                        await app.stop()
-                    except Exception:
-                        pass
-            try:
-                await s.edit_text(
-                    f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
-            except Exception:
-                pass
-            await asyncio.sleep(2.5)
+                    try: await app.stop()
+                    except Exception: pass
+            if i % 5 == 0 or i == len(accs) - 1:
+                try:
+                    await s.edit_text(
+                        f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
+                except Exception: pass
         return await s.edit_text(
             f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 async def _daily_reset():
     while True:
         await asyncio.sleep(86400)
         try:
             await reset_daily()
         except Exception as e:
-            log.error(f"daily: {e}")
+            log.error(f"daily reset: {e}")
 
 
 async def _run():
     ensure_silent()
-    log.info(f"🤖 Starting bot with OWNER_ID={OWNER_ID}")
+    log.info(f"🤖 Starting bot | OWNER_ID={OWNER_ID} | Pool MAX={auto_worker.MAX_POOL}")
     await bot.start()
     log.info("🤖 Bot started")
     asyncio.create_task(auto_worker.auto_watcher_loop())
