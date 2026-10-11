@@ -1,20 +1,13 @@
-"""
-Owner assigns quotas per user:
-  – max_reactions   (total per day)
-  – max_views       (total per day)
-  – max_vc_joins    (concurrent accounts in VC)
-  – max_channels    (auto-channels the user can own)
-  – max_accounts    (accounts user can store)
-"""
-from datetime import datetime, timedelta
+from datetime import datetime
 from database import plans, accounts, auto_channels
+from config import OWNER_ID
 
 DEFAULT_PLAN = {
-    "max_accounts": 5,
-    "max_reactions_per_day": 500,
-    "max_views_per_day": 500,
-    "max_vc_joins": 3,
-    "max_channels": 1,
+    "max_accounts": 0,
+    "max_reactions_per_day": 0,
+    "max_views_per_day": 0,
+    "max_vc_joins": 0,
+    "max_channels": 0,
     "expires_at": None,
 }
 
@@ -25,8 +18,21 @@ async def get_plan(uid: int):
 async def set_plan(uid: int, **kwargs):
     await plans.update_one({"user_id": uid}, {"$set": kwargs}, upsert=True)
 
+async def has_active_plan(uid: int) -> bool:
+    """Owner always passes. Others need a real non-expired plan."""
+    if uid == OWNER_ID:
+        return True
+    plan = await plans.find_one({"user_id": uid})
+    if not plan:
+        return False
+    if not plan.get("max_accounts"):
+        return False
+    exp = plan.get("expires_at")
+    if exp and datetime.utcnow() > exp:
+        return False
+    return True
+
 async def check_quota(uid: int, kind: str, amount: int = 1) -> tuple[bool, int]:
-    """kind in: accounts | reactions | views | vc | channels. Returns (allowed, remaining)."""
     plan = await get_plan(uid)
     expires = plan.get("expires_at")
     if expires and datetime.utcnow() > expires:
@@ -61,8 +67,6 @@ async def add_usage(uid: int, kind: str, amount: int = 1):
             upsert=True)
 
 async def reset_daily():
-    """Run once a day at 00:00 UTC."""
     await plans.update_many(
         {},
-        {"$set": {"reactions_used_today": 0, "views_used_today": 0}}
-    )
+        {"$set": {"reactions_used_today": 0, "views_used_today": 0}})
