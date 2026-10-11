@@ -16,7 +16,7 @@ _reaction_locks = {}
 # ── Persistent client pool ──────────────────────────
 _client_pool = {}
 _client_pool_lock = {}
-MAX_POOL = 200   # keep up to N clients hot
+MAX_POOL = 1000   # keep up to N clients hot
 DEAD_MARKERS = ("USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
                 "AUTH_KEY_UNREGISTERED", "USERNAME_NOT_OCCUPIED",
                 "PEER_ID_INVALID", "USER_ID_INVALID")
