@@ -21,69 +21,113 @@ def register(bot):
         ])
         await m.reply("👑 **Owner Panel**", reply_markup=kb)
 
+    @bot.on_message(filters.command("setplan") & filters.user(OWNER_ID))
+    async def _setplan_cmd(c, m):
+        try:
+            parts = m.text.split()
+            if len(parts) < 7:
+                raise ValueError(
+                    "Usage: /setplan <uid> <acc> <react> <view> <vc> <chan>")
+            uid = int(parts[1])
+            await set_plan(uid,
+                max_accounts=int(parts[2]),
+                max_reactions_per_day=int(parts[3]),
+                max_views_per_day=int(parts[4]),
+                max_vc_joins=int(parts[5]),
+                max_channels=int(parts[6]))
+            await m.reply(f"✅ Plan set for `{uid}`")
+        except Exception as e:
+            await m.reply(f"❌ {e}")
+
+    @bot.on_message(filters.command("delplan") & filters.user(OWNER_ID))
+    async def _delplan(c, m):
+        try:
+            uid = int(m.text.split()[1])
+            await plans.delete_one({"user_id": uid})
+            await m.reply(f"🗑 Plan removed for `{uid}`")
+        except Exception as e:
+            await m.reply(f"❌ Usage: /delplan <uid>")
+
     @bot.on_callback_query(filters.regex("^own_"))
     async def _owner_cb(c, q):
         if q.from_user.id != OWNER_ID:
             return await q.answer("Owner only.", show_alert=True)
         d = q.data
+
         if d == "own_stats":
             u = await users.count_documents({})
             a = await accounts.count_documents({})
             ch = await auto_channels.count_documents({})
+            p = await plans.count_documents({})
             return await q.message.reply(
-                f"📊 Users: `{u}` | Accounts: `{a}` | Channels: `{ch}`")
+                f"📊 Users: `{u}` | Accounts: `{a}` | Channels: `{ch}` | Plans: `{p}`")
+
         if d == "own_plans":
             docs = await plans.find({}).to_list(100)
+            if not docs:
+                return await q.message.reply("No plans assigned.")
             txt = "📋 **Plans**\n\n"
             for p in docs:
-                txt += (f"`{p['user_id']}` → acc:{p.get('max_accounts',0)} "
+                txt += (f"`{p['user_id']}` → "
+                        f"acc:{p.get('max_accounts',0)} "
                         f"r:{p.get('max_reactions_per_day',0)} "
                         f"v:{p.get('max_views_per_day',0)} "
                         f"vc:{p.get('max_vc_joins',0)} "
                         f"ch:{p.get('max_channels',0)}\n")
-            return await q.message.reply(txt or "No plans.")
+            return await q.message.reply(txt)
+
         if d == "own_setplan":
-            await q.message.reply(
-                "Send: `user_id max_accounts max_reactions max_views max_vc max_channels`")
-            c.user_data = getattr(c, "user_data", {})
-            c.user_data[q.from_user.id] = "await_setplan"
-            return
+            return await q.message.reply(
+                "Send: `/setplan <uid> <accounts> <reactions> <views> <vc> <channels>`\n\n"
+                "Example:\n`/setplan 123456789 5 500 500 3 2`")
+
         if d == "own_broadcast":
             c.user_data = getattr(c, "user_data", {})
             c.user_data[q.from_user.id] = "await_broadcast"
             return await q.message.reply("Send the broadcast message.")
 
-    @bot.on_message(filters.private, group=-1)
+        if d == "own_health":
+            c.user_data = getattr(c, "user_data", {})
+            c.user_data[q.from_user.id] = "await_health"
+            return await q.message.reply("Running health check...")
+
+    # ─── State machine for owner ───
+    @bot.on_message(filters.private & filters.user(OWNER_ID), group=-10)
     async def _owner_state(c, m):
-        if m.from_user.id != OWNER_ID or not m.text: return
         state = getattr(c, "user_data", {}).get(m.from_user.id)
-        if state == "await_setplan":
-            try:
-                parts = m.text.split()
-                uid = int(parts[0])
-                await set_plan(uid,
-                    max_accounts=int(parts[1]),
-                    max_reactions_per_day=int(parts[2]),
-                    max_views_per_day=int(parts[3]),
-                    max_vc_joins=int(parts[4]),
-                    max_channels=int(parts[5]))
-                c.user_data.pop(m.from_user.id, None)
-                await m.reply(f"✅ Plan set for `{uid}`")
-            except Exception as e:
-                await m.reply(f"❌ Format error: {e}")
-        elif state == "await_broadcast":
+        if state == "await_broadcast":
             c.user_data.pop(m.from_user.id, None)
             s = await m.reply("📢 Broadcasting...")
             ok = fail = 0
             async for u in users.find({}):
                 try:
                     await m.copy(u["user_id"]); ok += 1
-                except Exception: fail += 1
+                except Exception:
+                    fail += 1
+                await asyncio.sleep(0.05)
             await s.edit_text(f"✅ Sent `{ok}` | Failed `{fail}`")
-        elif state == "await_addadmin":
+        elif state == "await_health":
+            c.user_data.pop(m.from_user.id, None)
+            await _run_health(c, m)
+
+    async def _run_health(c, m):
+        from database import all_accounts
+        from pyrogram import Client
+        from config import API_ID, API_HASH
+        s = await m.reply("🩺 Health check running...")
+        accs = await all_accounts()
+        ok = dead = 0
+        for a in accs:
             try:
-                await admins.update_one({"user_id": int(m.text)},
-                                        {"$set": {}}, upsert=True)
-                c.user_data.pop(m.from_user.id, None)
-                await m.reply("✅ Admin added.")
-            except Exception: await m.reply("❌ Bad ID.")
+                async with Client(f"h_{uuid.uuid4().hex[:6]}",
+                                  api_id=API_ID, api_hash=API_HASH,
+                                  session_string=a["session"],
+                                  in_memory=True, no_updates=True) as app:
+                    await app.get_me(); ok += 1
+            except Exception:
+                dead += 1
+                await accounts.delete_one({"phone": a["phone"]})
+        await s.edit_text(f"✅ Alive: `{ok}` | 💀 Removed: `{dead}`")
+
+
+import uuid, asyncio
