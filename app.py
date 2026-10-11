@@ -1,23 +1,26 @@
-import asyncio, logging, os
-from pyrogram import Client, filters
-from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
+import asyncio, logging, uuid
+from pyrogram import Client, filters, idle
+from pyrogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
-from database import users
+from database import users, accounts, all_accounts, auto_channels
+from quota import reset_daily, has_active_plan, check_quota, get_plan
 import auto_worker
-from quota import reset_daily
-from vc_joiner import ensure_silent
+from vc_joiner import ensure_silent, leave_all, active_sessions
 
-import handlers.accounts, handlers.engagement, handlers.owner
+import handlers.owner, handlers.accounts, handlers.engagement
 import handlers.plans, handlers.broadcast
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
 
 bot = Client("multi_manager_bot",
              api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# register all handlers BEFORE any messages
 handlers.owner.register(bot)
 handlers.accounts.register(bot)
 handlers.engagement.register(bot)
@@ -43,114 +46,345 @@ def main_menu(uid):
 async def _start(c, m):
     uid = m.from_user.id
     await users.update_one({"user_id": uid},
-                           {"$setOnInsert": {"user_id": uid}}, upsert=True)
-
-    from quota import has_active_plan
+        {"$setOnInsert": {"user_id": uid}}, upsert=True)
     if not await has_active_plan(uid):
         return await m.reply(
             f"👋 **Welcome {m.from_user.first_name}**\n\n"
             f"🚫 **You don't have an active plan.**\n\n"
             f"Contact the owner to get access.\n\n"
-            f"🆔 Your User ID: `{uid}`\n"
-            f"_(Send this ID to the owner)_")
-
+            f"🆔 Your User ID: `{uid}`")
     await m.reply(
         f"👋 **Welcome {m.from_user.first_name}**\n\n"
-        f"Use the buttons below:",
+        f"Use the buttons below 👇",
         reply_markup=main_menu(uid))
 
 
-# ─── Button handlers ───
+# ─────────────────────────────────────────────────────────────
+# BUTTON HANDLERS — direct, no indirection
+# ─────────────────────────────────────────────────────────────
 @bot.on_message(filters.private & filters.regex("^📱 Add Account$"))
-async def _btn_add(c, m):
-    return await _btn_forward(c, m, "/addacc")
+async def _btn_addacc(c, m):
+    from handlers.accounts import _addacc_impl
+    await _addacc_impl(c, m)
+
 
 @bot.on_message(filters.private & filters.regex("^📦 Import$"))
-async def _btn_imp(c, m):
-    return await _btn_forward(c, m, "/import")
+async def _btn_import(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "import_file"}
+    await m.reply("📦 Send ZIP / session string / JSON / .session / .txt")
+
 
 @bot.on_message(filters.private & filters.regex("^🎭 Randomize$"))
-async def _btn_rnd(c, m):
-    return await _btn_forward(c, m, "/randomize")
+async def _btn_randomize(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "randomizer_zip"}
+    await m.reply("🎭 Send ZIP with names.txt + photos/ (or pairs.json)")
+
 
 @bot.on_message(filters.private & filters.regex("^📋 My Accounts$"))
-async def _btn_accs(c, m):
-    return await _btn_forward(c, m, "/accounts")
+async def _btn_myaccts(c, m):
+    uid = m.from_user.id
+    accs = await all_accounts()
+    mine = [a for a in accs
+            if a.get("added_by") == uid or uid == OWNER_ID]
+    if not mine:
+        return await m.reply("📋 You have no accounts yet.\n\nUse 📱 Add Account")
+    kb = []
+    for a in mine[:50]:
+        kb.append([InlineKeyboardButton(
+            f"⚙️ {a.get('name', '?')} | {a.get('phone', '?')}",
+            callback_data=f"acct_{a.get('phone', '')}")])
+    await m.reply(f"📋 **Your Accounts** ({len(mine)})\n\nTap to manage:",
+                  reply_markup=InlineKeyboardMarkup(kb))
+
 
 @bot.on_message(filters.private & filters.regex("^📺 Add Channel$"))
-async def _btn_ach(c, m):
-    return await _btn_forward(c, m, "/addchannel")
+async def _btn_addchan(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply(f"🚫 No active plan.\nYour ID: `{uid}`")
+    ok, rem = await check_quota(uid, "channels", 1)
+    if not ok:
+        return await m.reply(f"❌ Channel quota reached (remaining: {rem})")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "channel_link"}
+    await m.reply(
+        "📺 Send the channel link.\n"
+        "Accepted:\n"
+        "• `@username`\n"
+        "• `https://t.me/username`\n"
+        "• `https://t.me/+invite`")
+
 
 @bot.on_message(filters.private & filters.regex("^📺 Channels$"))
-async def _btn_chs(c, m):
-    return await _btn_forward(c, m, "/channels")
+async def _btn_channels(c, m):
+    from config import MAX_AUTO_CHANNELS
+    uid = m.from_user.id
+    query = {} if uid == OWNER_ID else {"added_by": uid}
+    docs = await auto_channels.find(query).to_list(MAX_AUTO_CHANNELS)
+    if not docs:
+        return await m.reply("📺 No auto-channels yet.")
+    txt = f"📺 **Auto Channels** ({len(docs)}/{MAX_AUTO_CHANNELS})\n\n"
+    kb = []
+    for d in docs:
+        txt += f"• `{d['link']}`\n"
+        kb.append([InlineKeyboardButton(f"🗑 Remove {d['link']}",
+                                        callback_data=f"rmch_{d['link']}")])
+    await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+
 
 @bot.on_message(filters.private & filters.regex("^🎤 Join VC$"))
-async def _btn_jvc(c, m):
-    return await m.reply(
-        "Usage: `/joinvc <channel_link_or_@username>`\n\n"
-        "Example: `/joinvc @unfindmusic`")
+async def _btn_joinvc(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "joinvc_link"}
+    await m.reply(
+        "🎤 Send the channel link where VC is LIVE:\n\n"
+        "Example: `@unfindmusic`\n\n"
+        "All your accounts will join the VC (mic muted).")
+
 
 @bot.on_message(filters.private & filters.regex("^🚪 Leave VC$"))
-async def _btn_lvc(c, m):
-    return await _btn_forward(c, m, "/leavevc")
+async def _btn_leavevc(c, m):
+    uid = m.from_user.id
+    if uid != OWNER_ID and not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    n = len(active_sessions())
+    await leave_all()
+    await m.reply(f"🚪 Left {n} VC session(s).")
+
 
 @bot.on_message(filters.private & filters.regex("^🔗 Join via Link$"))
-async def _btn_jl(c, m):
-    return await m.reply(
-        "Usage: `/joinlink <https://t.me/+xxxx>` or `/joinlink @channel`")
+async def _btn_joinlink(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "joinlink_input"}
+    await m.reply(
+        "🔗 Send the group/channel link for accounts to JOIN:\n\n"
+        "• Public: `@username` or `https://t.me/username`\n"
+        "• Private: `https://t.me/+invitehash`")
+
 
 @bot.on_message(filters.private & filters.regex("^🚪 Leave Link$"))
-async def _btn_ll(c, m):
-    return await m.reply(
-        "Usage: `/leavelink <https://t.me/+xxxx>` or `/leavelink @channel`")
+async def _btn_leavelink(c, m):
+    uid = m.from_user.id
+    if not await has_active_plan(uid):
+        return await m.reply("🚫 No active plan.")
+    c.user_data = getattr(c, "user_data", {})
+    c.user_data[uid] = {"step": "leavelink_input"}
+    await m.reply("🚪 Send the link for accounts to LEAVE:")
+
 
 @bot.on_message(filters.private & filters.regex("^💎 My Plan$"))
-async def _btn_plan(c, m):
-    return await _btn_forward(c, m, "/myplan")
+async def _btn_myplan(c, m):
+    p = await get_plan(m.from_user.id)
+    await m.reply(
+        f"💎 **Your Plan**\n\n"
+        f"📱 Max Accounts: `{p.get('max_accounts',0)}`\n"
+        f"❤️ Reactions/day: `{p.get('max_reactions_per_day',0)}`\n"
+        f"👀 Views/day: `{p.get('max_views_per_day',0)}`\n"
+        f"🎤 VC Joins: `{p.get('max_vc_joins',0)}`\n"
+        f"📺 Channels: `{p.get('max_channels',0)}`")
+
 
 @bot.on_message(filters.private & filters.regex("^🩺 Health$"))
 async def _btn_health(c, m):
     if m.from_user.id != OWNER_ID:
-        return await m.reply("Owner only.")
-    c.user_data = getattr(c, "user_data", {})
-    c.user_data[m.from_user.id] = "await_health"
-    return await m.reply("Running health check...")
+        return await m.reply("🩺 Owner only.")
+    await _do_health(c, m)
+
 
 @bot.on_message(filters.private & filters.regex("^👑 Owner Panel$"))
-async def _btn_owner(c, m):
+async def _btn_ownerpanel(c, m):
     if m.from_user.id != OWNER_ID:
-        return await m.reply("Owner only.")
-    return await _btn_forward(c, m, "/owner")
+        return await m.reply("👑 Owner only.")
+    await _do_owner_panel(c, m)
 
 
-async def _btn_forward(c, m, cmd):
-    """Simulate sending a command by injecting text."""
-    # Re-dispatch as if user sent the command
-    m.text = cmd
-    # We can't easily re-trigger, so just handle directly by calling handlers
-    if cmd == "/addacc":
-        from handlers.accounts import _addacc
-    # Simpler: instruct user
-    await m.reply(f"Send `{cmd}` to continue.")
+async def _do_owner_panel(c, m):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Stats", callback_data="own_stats")],
+        [InlineKeyboardButton("💎 Set Plan for User", callback_data="own_setplan")],
+        [InlineKeyboardButton("📋 List All Plans", callback_data="own_listplans")],
+        [InlineKeyboardButton("🚫 Remove User Plan", callback_data="own_delplan")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="own_broadcast")],
+        [InlineKeyboardButton("🩺 Health Check", callback_data="own_health")],
+        [InlineKeyboardButton("🗑 Clean Dead Sessions", callback_data="own_clean")],
+    ])
+    await m.reply("👑 **Owner Panel**\n\nChoose an action:",
+                  reply_markup=kb)
 
 
+async def _do_health(c, m):
+    from config import API_ID, API_HASH
+    s = await m.reply("🩺 Health check...")
+    accs = await all_accounts()
+    ok = dead = 0
+    for a in accs:
+        try:
+            async with Client(f"h_{uuid.uuid4().hex[:6]}",
+                              api_id=API_ID, api_hash=API_HASH,
+                              session_string=a["session"],
+                              in_memory=True, no_updates=True) as app:
+                await app.get_me()
+                ok += 1
+        except Exception:
+            dead += 1
+            await accounts.delete_one({"phone": a["phone"]})
+    await s.edit_text(f"🏁 Alive: `{ok}` | 💀 Removed: `{dead}`")
+
+
+# ─────────────────────────────────────────────────────────────
+# Text-input states
+# ─────────────────────────────────────────────────────────────
+@bot.on_message(filters.private & filters.text, group=5)
+async def _text_states(c, m):
+    ud = getattr(c, "user_data", {})
+    st = ud.get(m.from_user.id)
+    if not st or not isinstance(st, dict):
+        return
+    step = st.get("step")
+    txt = (m.text or "").strip()
+    if not txt or txt.startswith("/"):
+        return
+
+    if step == "joinvc_link":
+        ud.pop(m.from_user.id, None)
+        from vc_joiner import _join_one, ensure_silent
+        ensure_silent()
+        s = await m.reply(f"🎤 Joining VC `{txt}` with all accounts...")
+        accs = await all_accounts()
+        accs = [a for a in accs if a.get("session")]
+        if not accs:
+            return await s.edit_text("❌ No accounts in DB.")
+        joined = failed = 0
+        for i, acc in enumerate(accs):
+            cid = await _join_one(acc["phone"], acc["session"], txt)
+            if cid:
+                joined += 1
+            else:
+                failed += 1
+            try:
+                await s.edit_text(
+                    f"🎤 **Joining VC** `{txt}`\n"
+                    f"✅ `{joined}` ❌ `{failed}` ({i+1}/{len(accs)})")
+            except Exception:
+                pass
+            await asyncio.sleep(7)
+        return await s.edit_text(
+            f"🏁 **VC Join Complete**\n✅ `{joined}` ❌ `{failed}`")
+
+    if step == "joinlink_input":
+        ud.pop(m.from_user.id, None)
+        s = await m.reply(f"🔗 Joining `{txt}` with all accounts...")
+        accs = await all_accounts()
+        accs = [a for a in accs if a.get("session")]
+        if not accs:
+            return await s.edit_text("❌ No accounts.")
+        ok = fail = already = 0
+        for i, acc in enumerate(accs):
+            app = None
+            try:
+                app = Client(f"jl_{uuid.uuid4().hex[:6]}",
+                             api_id=API_ID, api_hash=API_HASH,
+                             session_string=acc["session"],
+                             in_memory=True, no_updates=True)
+                await app.start()
+                try:
+                    await app.join_chat(txt)
+                    ok += 1
+                except Exception as e:
+                    em = str(e).lower()
+                    if "already" in em:
+                        already += 1
+                    else:
+                        fail += 1
+            except Exception:
+                fail += 1
+            finally:
+                if app:
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
+            try:
+                await s.edit_text(
+                    f"🔗 `{ok}` ✅ | `{already}` ⏭ | `{fail}` ❌ "
+                    f"({i+1}/{len(accs)})")
+            except Exception:
+                pass
+            await asyncio.sleep(2.5)
+        return await s.edit_text(
+            f"🏁 **Join Complete**\n✅ `{ok}`\n⏭ `{already}`\n❌ `{fail}`")
+
+    if step == "leavelink_input":
+        ud.pop(m.from_user.id, None)
+        s = await m.reply(f"🚪 Leaving `{txt}`...")
+        accs = await all_accounts()
+        accs = [a for a in accs if a.get("session")]
+        if not accs:
+            return await s.edit_text("❌ No accounts.")
+        ok = fail = 0
+        for i, acc in enumerate(accs):
+            app = None
+            try:
+                app = Client(f"ll_{uuid.uuid4().hex[:6]}",
+                             api_id=API_ID, api_hash=API_HASH,
+                             session_string=acc["session"],
+                             in_memory=True, no_updates=True)
+                await app.start()
+                try:
+                    chat = await app.get_chat(txt)
+                    await app.leave_chat(chat.id)
+                    ok += 1
+                except Exception:
+                    fail += 1
+            except Exception:
+                fail += 1
+            finally:
+                if app:
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
+            try:
+                await s.edit_text(
+                    f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
+            except Exception:
+                pass
+            await asyncio.sleep(2.5)
+        return await s.edit_text(
+            f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
+
+
+# ─────────────────────────────────────────────────────────────
 async def _daily_reset():
     while True:
         await asyncio.sleep(86400)
         try:
             await reset_daily()
         except Exception as e:
-            log.error(f"daily reset: {e}")
+            log.error(f"daily: {e}")
 
 
 async def _run():
     ensure_silent()
+    log.info(f"🤖 Starting bot with OWNER_ID={OWNER_ID}")
     await bot.start()
     log.info("🤖 Bot started")
     asyncio.create_task(auto_worker.auto_watcher_loop())
     asyncio.create_task(_daily_reset())
-    from pyrogram import idle
     await idle()
     await bot.stop()
 
