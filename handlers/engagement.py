@@ -178,4 +178,108 @@ def register(bot):
                     ok += 1
                 except Exception as e:
                     em = str(e).lower()
-                    if "already" in
+                    if "already" in em or "user_already" in em:
+                        already += 1
+                    else:
+                        fail += 1
+                        logger.debug(f"join fail {acc.get('phone')}: {e}")
+            except Exception as e:
+                fail += 1
+                logger.debug(f"client err {acc.get('phone')}: {e}")
+            finally:
+                if app:
+                    try: await app.stop()
+                    except Exception: pass
+
+            try:
+                await s.edit_text(
+                    f"🔗 **Joining** `{target}`\n"
+                    f"✅ `{ok}` | ⏭ `{already}` | ❌ `{fail}` "
+                    f"({i+1}/{len(accs)})")
+            except Exception:
+                pass
+            await asyncio.sleep(2.5)
+
+        await s.edit_text(
+            f"🏁 **Join Complete** `{target}`\n"
+            f"✅ Joined: `{ok}`\n"
+            f"⏭ Already in: `{already}`\n"
+            f"❌ Failed: `{fail}`")
+
+    # ─────────────────────────────────────────
+    # /leavelink <invite_or_username> — accounts leave group
+    # ─────────────────────────────────────────
+    @bot.on_message(filters.command("leavelink"))
+    async def _leavelink(c, m):
+        uid = m.from_user.id
+        if not (await has_active_plan(uid) or uid == OWNER_ID):
+            return await m.reply("🚫 No active plan.")
+        parts = m.text.split(maxsplit=1)
+        if len(parts) < 2:
+            return await m.reply(
+                "Usage: `/leavelink <https://t.me/+xxxx>` or `/leavelink @channel`")
+        target = parts[1].strip()
+
+        s = await m.reply(f"🚪 Leaving `{target}` with all accounts...")
+        accs = await all_accounts()
+        accs = [a for a in accs if a.get("session")]
+        if not accs:
+            return await s.edit_text("❌ No accounts.")
+
+        ok = fail = 0
+        for i, acc in enumerate(accs):
+            app = None
+            try:
+                app = Client(f"ll_{uuid.uuid4().hex[:6]}",
+                             api_id=API_ID, api_hash=API_HASH,
+                             session_string=acc["session"],
+                             in_memory=True, no_updates=True)
+                await app.start()
+                try:
+                    chat = await app.get_chat(target)
+                    await app.leave_chat(chat.id)
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+                    logger.debug(f"leave fail {acc.get('phone')}: {e}")
+            except Exception as e:
+                fail += 1
+                logger.debug(f"client err {acc.get('phone')}: {e}")
+            finally:
+                if app:
+                    try: await app.stop()
+                    except Exception: pass
+
+            try:
+                await s.edit_text(
+                    f"🚪 **Leaving** `{target}`\n"
+                    f"✅ `{ok}` ❌ `{fail}` ({i+1}/{len(accs)})")
+            except Exception:
+                pass
+            await asyncio.sleep(2.5)
+
+        await s.edit_text(
+            f"🏁 **Leave Complete** `{target}`\n✅ `{ok}` ❌ `{fail}`")
+
+    # ─────────────────────────────────────────
+    # Channel-link state machine
+    # ─────────────────────────────────────────
+    @bot.on_message(filters.private, group=-3)
+    async def _state(c, m):
+        ud = getattr(c, "user_data", {})
+        st = ud.get(m.from_user.id)
+        if not st or not isinstance(st, dict):
+            return
+        if st.get("step") == "channel_link" and m.text:
+            link = m.text.strip()
+            if "t.me/" not in link and not link.startswith("@"):
+                return await m.reply("❌ Invalid link.")
+            await auto_channels.update_one(
+                {"link": link},
+                {"$set": {"link": link, "added_by": m.from_user.id}},
+                upsert=True)
+            ud.pop(m.from_user.id, None)
+            await m.reply(
+                f"✅ Added `{link}`.\n"
+                f"First scan will just mark existing posts (no reaction).\n"
+                f"New posts + VC will be handled automatically within 30s.")
