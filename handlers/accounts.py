@@ -1,4 +1,4 @@
-import os, uuid, shutil, zipfile, logging
+import os, uuid, shutil, zipfile, logging, base64
 from pyrogram import filters, Client
 from pyrogram.errors import SessionPasswordNeeded
 from config import API_ID, API_HASH, OWNER_ID
@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 async def _addacc_impl(c, m):
-    """Shared implementation — called from command or button."""
     uid = m.from_user.id
     if not await has_active_plan(uid):
         return await m.reply(f"🚫 No active plan.\nYour ID: `{uid}`")
