@@ -1,4 +1,4 @@
-"""quota.py — owner bypasses all limits"""
+"""quota.py — owner bypass"""
 from datetime import datetime
 from database import plans, accounts, auto_channels
 from config import OWNER_ID
@@ -6,7 +6,6 @@ from config import OWNER_ID
 DEFAULT_PLAN = {"max_accounts": 0, "max_reactions_per_day": 0,
                 "max_views_per_day": 0, "max_vc_joins": 0,
                 "max_channels": 0, "expires_at": None}
-
 UNLIMITED = 10**9
 
 
