@@ -1,6 +1,7 @@
 """
-Joins voice chats using PyTgCalls 2.x. Mic stays muted; plays silent WAV.
-Multiple accounts can join the SAME VC in parallel.
+vc_joiner.py — PyTgCalls v3 compatible
+Joins voice chats with muted mic by playing silent WAV.
+Multiple accounts join the same VC in parallel.
 """
 import asyncio, uuid, os, wave, logging
 from pyrogram import Client
@@ -10,24 +11,33 @@ from database import all_accounts
 
 logger = logging.getLogger(__name__)
 
-# --- Import PyTgCalls with v2-compatible fallback ---
+# ─── Detect available PyTgCalls API ───────────────────────
 PyTgCalls = None
 MediaStream = None
+AudioQuality = None
+MediaStreamAudio = None
 PYTGCALLS_OK = False
 
 try:
     from pytgcalls import PyTgCalls
+    from pytgcalls.types import MediaStream
     try:
-        from pytgcalls.types import MediaStream
+        from pytgcalls.types import AudioQuality
     except ImportError:
-        # v0.9.x fallback path
-        from pytgcalls.types.input_stream import InputStream as MediaStream
+        AudioQuality = None
+    try:
+        from pytgcalls.types import MediaStreamAudio
+    except ImportError:
+        MediaStreamAudio = None
     PYTGCALLS_OK = True
-    logger.info(f"PyTgCalls loaded: {PyTgCalls}")
+    logger.info(f"✅ PyTgCalls loaded — MediaStream={MediaStream}, "
+                f"AudioQuality={'yes' if AudioQuality else 'no'}, "
+                f"MediaStreamAudio={'yes' if MediaStreamAudio else 'no'}")
 except Exception as e:
-    logger.error(f"PyTgCalls unavailable: {e}")
+    logger.error(f"❌ PyTgCalls unavailable: {e}")
 
-_active_sessions = {}     # phone -> {"client","call","chat_id"}
+
+_active_sessions = {}     # phone -> {"client","call","chat_id","title"}
 _stop_events = {}         # key -> asyncio.Event
 
 
@@ -40,8 +50,45 @@ def ensure_silent():
     logger.info(f"✅ {SILENT_WAV} created")
 
 
+def _build_stream(path: str):
+    """
+    Build a stream object compatible with whichever PyTgCalls API is present.
+
+    v3.x: MediaStream(audio=MediaStreamAudio(path, AudioQuality.HIGH))
+    v2.x: MediaStream(path)
+    v0.9: AudioPiped(path)
+    """
+    # ── Try v3 typed API ──
+    if MediaStreamAudio is not None:
+        try:
+            if AudioQuality is not None:
+                audio = MediaStreamAudio(path, AudioQuality.HIGH)
+            else:
+                audio = MediaStreamAudio(path)
+            return MediaStream(audio=audio)
+        except Exception as e:
+            logger.debug(f"v3 MediaStreamAudio build failed: {e}")
+
+    # ── Try v2 positional ──
+    try:
+        return MediaStream(path)
+    except Exception as e:
+        logger.debug(f"v2 MediaStream(pos) failed: {e}")
+
+    # ── Try v0.9 AudioPiped ──
+    try:
+        from pytgcalls.types.input_stream import AudioPiped
+        return AudioPiped(path)
+    except Exception as e:
+        logger.debug(f"AudioPiped failed: {e}")
+
+    # ── Last resort — pass raw path ──
+    logger.warning("No compatible MediaStream constructor — passing raw path")
+    return path
+
+
 async def is_vc_live(app: Client, chat_id) -> bool:
-    """Detect an active voice chat via raw API."""
+    """Detect active voice chat via raw MTProto call."""
     try:
         peer = await app.resolve_peer(chat_id)
         try:
@@ -59,42 +106,33 @@ async def is_vc_live(app: Client, chat_id) -> bool:
 
 async def _play_muted(call_py, chat_id, media_path):
     """
-    PyTgCalls v2.x: play then mute.
-    PyTgCalls v0.9.x: play(muted=True) supported.
+    Play the media then immediately mute.
+    Works across PyTgCalls v0.9 / v2 / v3.
     """
-    # Try v2 API first
-    try:
-        stream = MediaStream(media_path)
-    except TypeError:
-        # Some v2 versions want MediaStream(audio=...)
-        try:
-            from pytgcalls.types import AudioPiped
-            stream = AudioPiped(media_path)
-        except Exception:
-            stream = media_path
+    stream = _build_stream(media_path)
 
-    # Attempt 1: v0.9.x muted kwarg
+    # ── Attempt 1: v0.9 style (muted=True kwarg) ──
     try:
         await call_py.play(chat_id, stream, muted=True)
-        logger.debug(f"played muted via v0.9 API → {chat_id}")
+        logger.debug(f"✅ play(muted=True) OK → {chat_id}")
         return True
     except TypeError:
-        pass
+        pass  # v2/v3 — no muted param
     except Exception as e:
         logger.debug(f"play(muted=True) failed: {e}")
 
-    # Attempt 2: v2.x play + mute
+    # ── Attempt 2: v2/v3 (play, then mute) ──
     try:
         await call_py.play(chat_id, stream)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.7)
         try:
             await call_py.mute(chat_id)
+            logger.debug(f"✅ play + mute OK → {chat_id}")
         except Exception as me:
             logger.debug(f"mute() failed (still joined): {me}")
-        logger.debug(f"played then muted via v2 API → {chat_id}")
         return True
     except Exception as e:
-        logger.error(f"play failed for {chat_id}: {e}")
+        logger.error(f"❌ play failed for {chat_id}: {e}")
         return False
 
 
@@ -123,14 +161,12 @@ async def _join_one(phone: str, session: str, chat_target: str):
                 await app.stop()
                 return None
 
-        # Start PyTgCalls
         call_py = PyTgCalls(app)
         await call_py.start()
 
-        # Play muted
         played = await _play_muted(call_py, chat.id, SILENT_WAV)
         if not played:
-            logger.warning(f"{phone}: play failed, but staying in VC")
+            logger.warning(f"{phone}: play failed but staying in VC (silent)")
 
         _active_sessions[phone] = {
             "client": app,
@@ -172,19 +208,15 @@ async def leave_all():
 async def auto_vc_worker(key: str, chat_target: str, stop_event: asyncio.Event,
                          max_accounts: int | None = None,
                          join_scan: bool = False):
-    """
-    Continuously monitor a channel/group:
-      • VC live  → join with all (or max_accounts) sessions
-      • VC ended → leave all
-    """
+    """Monitor channel. VC live → join all. VC ends → leave all."""
     if not PYTGCALLS_OK:
         logger.error("auto_vc_worker: PyTgCalls not available")
         return
 
     ensure_silent()
     _stop_events[key] = stop_event
-
     joined = False
+
     while not stop_event.is_set():
         try:
             accs = await all_accounts()
@@ -195,7 +227,7 @@ async def auto_vc_worker(key: str, chat_target: str, stop_event: asyncio.Event,
                 await asyncio.sleep(30)
                 continue
 
-            # Probe VC status with the first account (cheap, no join)
+            # Cheap probe: is VC live?
             probe = accs[0]
             live = False
             try:
@@ -211,7 +243,7 @@ async def auto_vc_worker(key: str, chat_target: str, stop_event: asyncio.Event,
                 logger.debug(f"probe failed: {e}")
 
             if live and not joined:
-                logger.info(f"🎤 VC LIVE in {chat_target} — joining with {len(accs)} accounts")
+                logger.info(f"🎤 VC LIVE in {chat_target} — joining {len(accs)} accounts")
                 for acc in accs:
                     if stop_event.is_set():
                         break
