@@ -1,4 +1,4 @@
-"""vc_joiner.py — final, no GroupcallForbidden, drops dead accounts."""
+"""vc_joiner.py — final"""
 import asyncio, uuid, os, wave, logging
 from pyrogram import Client
 from pyrogram.raw import functions
@@ -14,9 +14,9 @@ try:
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
     PYTGCALLS_OK = True
-    logger.info("✅ PyTgCalls loaded")
+    logger.info("PyTgCalls loaded")
 except Exception as e:
-    logger.error(f"❌ PyTgCalls unavailable: {e}")
+    logger.error(f"PyTgCalls unavailable: {e}")
 
 _active_sessions = {}
 _stop_events = {}
@@ -29,7 +29,9 @@ def ensure_silent():
     if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 1000:
         return
     with wave.open(SILENT_WAV, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
         w.writeframes(b"\x00\x00" * 44100 * 5)
     logger.info("silent.wav created")
 
@@ -41,7 +43,7 @@ async def is_vc_live(app, chat_id):
             full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
             call = getattr(full.full_chat, "call", None)
             if call:
-                logger.info(f"🎤 VC detected → {chat_id}")
+                logger.info(f"VC detected -> {chat_id}")
                 return True
         except Exception as e:
             logger.debug(f"GetFullChannel: {e}")
@@ -87,7 +89,7 @@ async def _drop_dead(phone, err=""):
     from database import accounts
     try:
         await accounts.delete_one({"phone": phone})
-        logger.warning(f"🗑 Dropped dead account {phone} — {err[:80]}")
+        logger.warning(f"Dropped dead {phone} -- {err[:80]}")
     except Exception:
         pass
 
@@ -125,11 +127,12 @@ async def _join_one(phone, session, chat_target):
         if not played:
             logger.warning(f"{phone}: play failed (still in VC)")
         _active_sessions[phone] = {
-            "client": app, "call": call_py,
+            "client": app,
+            "call": call_py,
             "chat_id": chat.id,
             "title": getattr(chat, "title", str(chat.id)),
         }
-        logger.info(f"🎤 {phone} joined VC: {_active_sessions[phone]['title']}")
+        logger.info(f"{phone} joined VC: {_active_sessions[phone]['title']}")
         return chat.id
     except Exception as e:
         err = str(e)
@@ -138,19 +141,26 @@ async def _join_one(phone, session, chat_target):
         else:
             logger.error(f"VC join {phone}: {err}")
         if app:
-            try: await app.stop()
-            except Exception: pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
         return None
 
 
 async def leave_one(phone):
     blk = _active_sessions.pop(phone, None)
-    if not blk: return
-    try: await blk["call"].leave_call(blk["chat_id"])
-    except Exception: pass
-    try: await blk["client"].stop()
-    except Exception: pass
-    logger.info(f"🚪 {phone} left VC")
+    if not blk:
+        return
+    try:
+        await blk["call"].leave_call(blk["chat_id"])
+    except Exception:
+        pass
+    try:
+        await blk["client"].stop()
+    except Exception:
+        pass
+    logger.info(f"{phone} left VC")
 
 
 async def leave_all():
@@ -159,11 +169,12 @@ async def leave_all():
 
 
 async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
-    if not PYTGCALLS_OK: return
+    if not PYTGCALLS_OK:
+        return
     ensure_silent()
     _stop_events[key] = stop_event
     joined = False
-    logger.info(f"🎤 VC worker started: {chat_target}")
+    logger.info(f"VC worker started: {chat_target}")
     while not stop_event.is_set():
         try:
             accs = await all_accounts()
@@ -182,22 +193,24 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                                   in_memory=True, no_updates=True) as pc:
                     chat = await pc.get_chat(chat_target)
                     live = await is_vc_live(pc, chat.id)
-                    logger.info(f"🎤 probe {chat_target}: live={live}")
+                    logger.info(f"probe {chat_target}: live={live}")
             except Exception as e:
                 err = str(e)
                 if any(m in err for m in DEAD_MARKERS):
                     await _drop_dead(probe["phone"], err)
                 logger.warning(f"probe failed: {err}")
             if live and not joined:
-                logger.info(f"🎤 VC LIVE — joining {len(accs)} accounts")
+                logger.info(f"VC LIVE -- joining {len(accs)} accounts")
                 for acc in accs:
-                    if stop_event.is_set(): break
-                    if acc["phone"] in _active_sessions: continue
+                    if stop_event.is_set():
+                        break
+                    if acc["phone"] in _active_sessions:
+                        continue
                     await _join_one(acc["phone"], acc["session"], chat_target)
                     await asyncio.sleep(VC_JOIN_DELAY)
                 joined = True
             elif not live and joined:
-                logger.info(f"🎤 VC ended — leaving all")
+                logger.info(f"VC ended -- leaving all")
                 await leave_all()
                 joined = False
         except Exception as e:
@@ -209,7 +222,8 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
 
 def stop_worker(key):
     ev = _stop_events.get(key)
-    if ev: ev.set()
+    if ev:
+        ev.set()
 
 
 def active_sessions():
