@@ -1,4 +1,4 @@
-"""vc_joiner.py — final, no GroupcallForbidden"""
+"""vc_joiner.py — no GroupcallForbidden anywhere."""
 import asyncio, uuid, os, wave, logging
 from pyrogram import Client
 from pyrogram.raw import functions
