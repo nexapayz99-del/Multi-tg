@@ -1,13 +1,11 @@
-import os, uuid, asyncio, logging
-from pyrogram import filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import os, uuid, asyncio, logging, shutil, zipfile
+from pyrogram import filters, Client
 from pyrogram.errors import SessionPasswordNeeded
 from config import API_ID, API_HASH, OWNER_ID
-from database import accounts, all_accounts, get_account
-from quota import check_quota
-from session_manager import import_any_string, import_zip
+from database import accounts, all_accounts, save_account
+from quota import check_quota, has_active_plan
+from session_manager import import_any_string, import_file, import_zip
 from indian_randomizer import apply_randomizer
-from pyrogram import Client
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +13,11 @@ def register(bot):
 
     @bot.on_message(filters.command("addacc"))
     async def _addacc(c, m):
+        if not await has_active_plan(m.from_user.id):
+            return await m.reply(
+                f"🚫 **No active plan.**\n\n"
+                f"Contact the owner to get access.\n"
+                f"Your ID: `{m.from_user.id}`")
         ok, rem = await check_quota(m.from_user.id, "accounts", 1)
         if not ok:
             return await m.reply(f"❌ Account quota reached (remaining: {rem})")
@@ -24,12 +27,16 @@ def register(bot):
 
     @bot.on_message(filters.command("import"))
     async def _import(c, m):
+        if not await has_active_plan(m.from_user.id):
+            return await m.reply("🚫 No active plan. Contact owner.")
         c.user_data = getattr(c, "user_data", {})
         c.user_data[m.from_user.id] = {"step": "import_file"}
         await m.reply("📦 Send `.zip`, `.session`, `.json`, `.txt`, or session string.")
 
     @bot.on_message(filters.command("randomize"))
     async def _randomize(c, m):
+        if not await has_active_plan(m.from_user.id):
+            return await m.reply("🚫 No active plan. Contact owner.")
         c.user_data = getattr(c, "user_data", {})
         c.user_data[m.from_user.id] = {"step": "randomizer_zip"}
         await m.reply("📦 Send ZIP containing `names.txt` + photos (or `pairs.json`).")
@@ -37,23 +44,24 @@ def register(bot):
     @bot.on_message(filters.command("accounts"))
     async def _list(c, m):
         accs = await all_accounts()
-        accs = [a for a in accs if a.get("added_by") == m.from_user.id or m.from_user.id == OWNER_ID]
-        if not accs: return await m.reply("No accounts.")
-        txt = f"📱 **Your Accounts** ({len(accs)})\n\n"
-        for a in accs[:50]:
+        mine = [a for a in accs if a.get("added_by") == m.from_user.id or m.from_user.id == OWNER_ID]
+        if not mine:
+            return await m.reply("No accounts.")
+        txt = f"📱 **Your Accounts** ({len(mine)})\n\n"
+        for a in mine[:50]:
             txt += f"• `{a.get('phone')}` — {a.get('name','?')}\n"
         await m.reply(txt)
 
-    # --- State machine for login / file import ---
+    # ─── State machine (login, file import, randomizer) ───
     @bot.on_message(filters.private, group=-2)
     async def _states(c, m):
         ud = getattr(c, "user_data", {})
         st = ud.get(m.from_user.id)
-        if not st: return
-
+        if not st:
+            return
         step = st.get("step") if isinstance(st, dict) else None
 
-        # File import
+        # ─── File import ───
         if step == "import_file" and (m.document or m.text):
             if m.document:
                 s = await m.reply("⏳ Downloading...")
@@ -61,13 +69,12 @@ def register(bot):
                 tmp = f"imp_{uuid.uuid4().hex[:8]}"
                 os.makedirs(tmp, exist_ok=True)
                 try:
-                    import shutil, zipfile
                     if path.lower().endswith(".zip"):
-                        with zipfile.ZipFile(path) as z: z.extractall(tmp)
+                        with zipfile.ZipFile(path) as z:
+                            z.extractall(tmp)
                         ok, fail = await import_zip(path, m.from_user.id)
                     else:
                         shutil.copy2(path, os.path.join(tmp, os.path.basename(path)))
-                        from session_manager import import_file
                         ok, fail = await import_file(path, m.from_user.id, tmp)
                     await s.edit_text(f"✅ Imported: `{ok}` | ❌ Failed: `{fail}`")
                 finally:
@@ -76,7 +83,6 @@ def register(bot):
                     shutil.rmtree(tmp, ignore_errors=True)
                 ud.pop(m.from_user.id, None)
                 return
-            # text — try session string
             if m.text and await import_any_string(m.text.strip(), m.from_user.id):
                 await m.reply("✅ Session imported.")
             else:
@@ -84,7 +90,7 @@ def register(bot):
             ud.pop(m.from_user.id, None)
             return
 
-        # Randomizer ZIP
+        # ─── Randomizer ───
         if step == "randomizer_zip" and m.document:
             s = await m.reply("⏳ Applying randomizer...")
             path = await m.download()
@@ -100,7 +106,7 @@ def register(bot):
             ud.pop(m.from_user.id, None)
             return
 
-        # Login flow
+        # ─── Login flow ───
         if step == "phone" and m.text:
             try:
                 temp = Client(f"temp_{uuid.uuid4().hex[:6]}",
@@ -109,7 +115,8 @@ def register(bot):
                 await temp.connect()
                 code_obj = await temp.send_code(m.text.strip())
                 ud[m.from_user.id] = {"step": "code", "phone": m.text.strip(),
-                                      "hash": code_obj.phone_code_hash, "client": temp}
+                                      "hash": code_obj.phone_code_hash,
+                                      "client": temp}
                 await m.reply("📩 Enter OTP:")
             except Exception as e:
                 await m.reply(f"❌ {e}")
@@ -145,7 +152,6 @@ def register(bot):
         phone = ud[m.from_user.id]["phone"]
         ss = await temp.export_session_string()
         me = await temp.get_me()
-        from database import save_account
         await save_account(phone, ss, me.first_name, m.from_user.id, {"id": me.id})
         await m.reply(f"✅ Logged in as **{me.first_name}**")
         try: await temp.disconnect()
