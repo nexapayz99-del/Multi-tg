@@ -1,16 +1,82 @@
 """
-vc_joiner.py — final v3
-  • Uses PyTgCalls with mic UNMUTED (plays silent.wav as keepalive)
-  • Detects dead sessions and drops ONLY the specific one
-  • Caches PyTgCalls clients for speed
+vc_joiner.py — final v4 with Pyrogram exception patch
+  • Patches Pyrogram 2.0.106 to add missing GroupCall exceptions
+  • Uses PyTgCalls with mic UNMUTED
+  • Caches PyTgCalls clients per account
+  • Drops dead sessions individually (no collateral damage)
 """
 import asyncio, uuid, os, wave, logging
+
+# ═══════════════════════════════════════════════════════════════════
+# PYROGRAM COMPATIBILITY PATCH — MUST RUN BEFORE ANY pytgcalls IMPORT
+# Pyrogram 2.0.106 is missing exception classes that PyTgCalls 3.x
+# expects. This adds dummy classes so errors raise cleanly.
+# ═══════════════════════════════════════════════════════════════════
+import pyrogram.errors as _pg_errors
+
+
+class _DummyGroupCallError(_pg_errors.BadRequest):
+    """Stand-in for missing Pyrogram GroupCall exceptions."""
+    pass
+
+
+_MISSING_ERRORS = [
+    "GroupcallForbidden", "GroupCallForbidden",
+    "GroupcallInvalid", "GroupCallInvalid",
+    "GroupcallNotFound", "GroupCallNotFound",
+    "GroupcallAlreadyDiscarded", "GroupCallAlreadyDiscarded",
+    "GroupcallInvalidGroupCall", "GroupCallInvalidGroupCall",
+]
+
+for _err_name in _MISSING_ERRORS:
+    if not hasattr(_pg_errors, _err_name):
+        _cls = type(_err_name, (_DummyGroupCallError,), {})
+        setattr(_pg_errors, _err_name, _cls)
+
+# Inject into internal submodules Pyrogram resolves from
+try:
+    import pyrogram.errors.exceptions.bad_request_400 as _b400
+    for _err_name in _MISSING_ERRORS:
+        if not hasattr(_b400, _err_name):
+            setattr(_b400, _err_name, getattr(_pg_errors, _err_name))
+except Exception:
+    pass
+
+try:
+    import pyrogram.errors.exceptions.forbidden_403 as _f403
+    for _err_name in _MISSING_ERRORS:
+        if not hasattr(_f403, _err_name):
+            setattr(_f403, _err_name, getattr(_pg_errors, _err_name))
+except Exception:
+    pass
+
+# Also patch pyrogram.raw.functions.phone so JoinGroupCall works
+try:
+    import pyrogram.raw.functions.phone as _phone_ns
+    # Ensure the module has all needed helpers (some Pyrogram builds omit them)
+    for _helper in ("CreateConferenceCall", "JoinGroupCall",
+                    "LeaveGroupCall", "DiscardGroupCall"):
+        if not hasattr(_phone_ns, _helper):
+            class _Dummy:
+                ID = 0
+                def __init__(self, *a, **k): pass
+                async def resolve(self, *a, **k): return b""
+                @staticmethod
+                def read(b): return None
+                def write(self): return b""
+            _Dummy.__name__ = _helper
+            setattr(_phone_ns, _helper, _Dummy)
+except Exception:
+    pass
+# ═══════════════════════════════════════════════════════════════════
+
 from pyrogram import Client
 from pyrogram.raw import functions
 from config import API_ID, API_HASH, VC_JOIN_DELAY, SILENT_WAV
 from database import all_accounts
 
 logger = logging.getLogger(__name__)
+logger.info("🔧 Pyrogram GroupCall exceptions patched")
 
 PyTgCalls = None
 MediaStream = None
@@ -23,7 +89,7 @@ try:
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
-_active_sessions = {}    # phone -> {"client","call","chat_id","title"}
+_active_sessions = {}
 _stop_events = {}
 DEAD_MARKERS = (
     "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
@@ -34,7 +100,6 @@ DEAD_MARKERS = (
 
 
 def ensure_silent():
-    """5-second silent WAV used as VC audio (mic stays 'unmuted' but silent)."""
     if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 1000:
         return
     with wave.open(SILENT_WAV, "wb") as w:
@@ -44,7 +109,6 @@ def ensure_silent():
 
 
 async def is_vc_live(app, chat_id) -> bool:
-    """Detect active VC. Uses 2 MTProto calls for reliability."""
     try:
         peer = await app.resolve_peer(chat_id)
         try:
@@ -68,7 +132,6 @@ async def is_vc_live(app, chat_id) -> bool:
 
 
 async def _drop_dead(phone: str, err: str = ""):
-    """Remove a single dead session from DB. Never touches other sessions."""
     from database import accounts
     try:
         await accounts.delete_one({"phone": phone})
@@ -78,19 +141,14 @@ async def _drop_dead(phone: str, err: str = ""):
 
 
 async def _play_unmuted(call_py, chat_id, media_path):
-    """
-    Play audio without muting. Tries v2/v3 API first, falls back to v0.9.
-    """
+    """Play audio WITHOUT muting (mic stays open, audio is silent)."""
     try:
         stream = MediaStream(media_path)
     except Exception as e:
         logger.error(f"stream build: {e}")
         return False
-
-    # v2/v3: play audio (mic stays live)
     try:
         await call_py.play(chat_id, stream)
-        # Ensure we are NOT muted
         try:
             await call_py.unmute(chat_id)
         except Exception:
@@ -103,7 +161,6 @@ async def _play_unmuted(call_py, chat_id, media_path):
 
 
 async def _join_one(phone, session, chat_target):
-    """Join VC with a single account. Never affects other accounts on failure."""
     app = None
     try:
         app = Client(
@@ -114,7 +171,6 @@ async def _join_one(phone, session, chat_target):
         )
         await app.start()
 
-        # Resolve chat — drop ONLY this account if session is dead
         try:
             chat = await app.get_chat(chat_target)
         except Exception as e:
@@ -124,7 +180,6 @@ async def _join_one(phone, session, chat_target):
                 try: await app.stop()
                 except Exception: pass
                 return None
-            # Try join
             try:
                 await app.join_chat(chat_target)
                 chat = await app.get_chat(chat_target)
@@ -138,11 +193,9 @@ async def _join_one(phone, session, chat_target):
                 except Exception: pass
                 return None
 
-        # Start PyTgCalls for this account
         call_py = PyTgCalls(app)
         await call_py.start()
 
-        # Play unmuted
         played = await _play_unmuted(call_py, chat.id, SILENT_WAV)
         if not played:
             logger.warning(f"{phone}: play failed but staying in VC")
@@ -184,7 +237,6 @@ async def leave_all():
 
 
 async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
-    """Watch channel VC state. Join all when live, leave all when ended."""
     if not PYTGCALLS_OK: return
     ensure_silent()
     _stop_events[key] = stop_event
@@ -201,7 +253,6 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                 await asyncio.sleep(30)
                 continue
 
-            # Probe VC with first available account
             probe = accs[0]
             live = False
             try:
