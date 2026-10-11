@@ -49,4 +49,41 @@ def register(bot):
             c.user_data[q.from_user.id] = "await_setplan"
             return
         if d == "own_broadcast":
-            c.user_data = get
+            c.user_data = getattr(c, "user_data", {})
+            c.user_data[q.from_user.id] = "await_broadcast"
+            return await q.message.reply("Send the broadcast message.")
+
+    @bot.on_message(filters.private, group=-1)
+    async def _owner_state(c, m):
+        if m.from_user.id != OWNER_ID or not m.text: return
+        state = getattr(c, "user_data", {}).get(m.from_user.id)
+        if state == "await_setplan":
+            try:
+                parts = m.text.split()
+                uid = int(parts[0])
+                await set_plan(uid,
+                    max_accounts=int(parts[1]),
+                    max_reactions_per_day=int(parts[2]),
+                    max_views_per_day=int(parts[3]),
+                    max_vc_joins=int(parts[4]),
+                    max_channels=int(parts[5]))
+                c.user_data.pop(m.from_user.id, None)
+                await m.reply(f"✅ Plan set for `{uid}`")
+            except Exception as e:
+                await m.reply(f"❌ Format error: {e}")
+        elif state == "await_broadcast":
+            c.user_data.pop(m.from_user.id, None)
+            s = await m.reply("📢 Broadcasting...")
+            ok = fail = 0
+            async for u in users.find({}):
+                try:
+                    await m.copy(u["user_id"]); ok += 1
+                except Exception: fail += 1
+            await s.edit_text(f"✅ Sent `{ok}` | Failed `{fail}`")
+        elif state == "await_addadmin":
+            try:
+                await admins.update_one({"user_id": int(m.text)},
+                                        {"$set": {}}, upsert=True)
+                c.user_data.pop(m.from_user.id, None)
+                await m.reply("✅ Admin added.")
+            except Exception: await m.reply("❌ Bad ID.")
