@@ -42,14 +42,6 @@ def main_menu(uid):
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
-# ─────────────────────────────────────────────────────────
-# FSub check — PERMANENTLY DISABLED
-# If any handler accidentally calls this, it always returns True
-# ─────────────────────────────────────────────────────────
-async def force_join_check(c, m_or_cb):
-    return True
-
-
 @bot.on_message(filters.command("start") & filters.private)
 async def _start(c, m):
     uid = m.from_user.id
@@ -234,7 +226,6 @@ async def _do_owner_panel(c, m):
 
 
 async def _do_health(c, m):
-    from config import API_ID, API_HASH
     import uuid
     s = await m.reply("🩺 Health check...")
     accs = await all_accounts()
