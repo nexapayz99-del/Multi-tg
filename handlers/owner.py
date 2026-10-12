@@ -12,6 +12,9 @@ _owner_flow = {}
 
 def register(bot):
 
+    # ═══════════════════════════════════════════════════
+    # MAIN PANEL
+    # ═══════════════════════════════════════════════════
     @bot.on_message(filters.command("owner") & filters.user(OWNER_ID))
     async def _owner_cmd(c, m):
         await _show_panel(m)
@@ -32,6 +35,9 @@ def register(bot):
         await m.reply("👑 **Owner Panel**\n\nChoose an action:",
                       reply_markup=kb)
 
+    # ═══════════════════════════════════════════════════
+    # CALLBACKS — main menu
+    # ═══════════════════════════════════════════════════
     @bot.on_callback_query(filters.regex("^own_"))
     async def _cb(c, q):
         if q.from_user.id != OWNER_ID:
@@ -39,6 +45,7 @@ def register(bot):
         d = q.data
         uid = q.from_user.id
 
+        # ─── STATS ───
         if d == "own_stats":
             u = await users.count_documents({})
             a = await accounts.count_documents({})
@@ -53,6 +60,7 @@ def register(bot):
                 f"💎 Active Plans: `{p}`\n"
                 f"🔨 Banned: `{b}`")
 
+        # ─── LIST ALL PLANS ───
         if d == "own_listplans":
             docs = await plans.find({}).to_list(200)
             if not docs:
@@ -68,7 +76,7 @@ def register(bot):
                     f"👀{p.get('max_views_per_day',0)} "
                     f"🎤{p.get('max_vc_joins',0)} "
                     f"📺{p.get('max_channels',0)} "
-                    f"[{p.get('duration','?')}→{exp_str}]\n")
+                    f"[{p.get('duration','?')} → {exp_str}]\n")
             kb = []
             for p in docs[:40]:
                 kb.append([InlineKeyboardButton(
@@ -76,6 +84,7 @@ def register(bot):
                     callback_data=f"own_rmplan_{p['user_id']}")])
             return await q.message.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
 
+        # ─── QUICK REMOVE PLAN ───
         if d.startswith("own_rmplan_"):
             target = int(d.split("_")[-1])
             ok = await remove_plan(target)
@@ -88,6 +97,7 @@ def register(bot):
                 return
             return await q.answer("No plan found.", show_alert=True)
 
+        # ─── SET PLAN ───
         if d == "own_setplan":
             _owner_flow[uid] = {"step": "plan_await_uid"}
             return await q.message.reply(
@@ -96,11 +106,13 @@ def register(bot):
                 "_(User can get their ID by sending /start to the bot)_\n\n"
                 "Cancel: /cancel")
 
+        # ─── REMOVE PLAN ───
         if d == "own_delplan":
             _owner_flow[uid] = {"step": "plan_await_remove_uid"}
             return await q.message.reply(
                 "🚫 Send the **User ID** to remove plan from.\n\nCancel: /cancel")
 
+        # ─── LIST USERS ───
         if d == "own_listusers":
             docs = await users.find({}).to_list(200)
             if not docs:
@@ -114,6 +126,7 @@ def register(bot):
                 txt += f"{status} `{uid_}`\n"
             return await q.message.reply(txt)
 
+        # ─── BAN / UNBAN ───
         if d == "own_ban":
             _owner_flow[uid] = {"step": "ban_await_uid"}
             return await q.message.reply(
@@ -124,24 +137,74 @@ def register(bot):
             return await q.message.reply(
                 "✅ Send the **User ID** to UNBAN.\n\nCancel: /cancel")
 
+        # ─── BROADCAST ───
         if d == "own_broadcast":
             _owner_flow[uid] = {"step": "await_broadcast"}
             return await q.message.reply(
                 "📢 Send the message to broadcast.\n\nCancel: /cancel")
 
+        # ─── HEALTH ───
         if d == "own_health":
             asyncio.create_task(_run_health(q.message))
             return await q.answer("Health check started...", show_alert=True)
 
+        # ─── CLEAN DEAD ───
         if d == "own_clean":
             asyncio.create_task(_clean_dead(q.message))
             return await q.answer("Cleaning dead sessions...", show_alert=True)
 
+    # ═══════════════════════════════════════════════════
+    # DURATION PICKER — separate callback handler
+    # ═══════════════════════════════════════════════════
+    @bot.on_callback_query(filters.regex("^own_dur_"))
+    async def _duration_cb(c, q):
+        if q.from_user.id != OWNER_ID:
+            return await q.answer("Owner only.", show_alert=True)
+
+        flow = _owner_flow.get(q.from_user.id)
+        if not flow or flow.get("step") != "plan_await_duration":
+            return await q.answer(
+                "Start again with /owner → 💎 Set Plan.",
+                show_alert=True)
+
+        duration = q.data.replace("own_dur_", "")
+        data = flow["data"]
+        target = data["user_id"]
+
+        await set_plan(
+            target,
+            duration=duration,
+            max_accounts=data["max_accounts"],
+            max_reactions_per_day=data["max_reactions_per_day"],
+            max_views_per_day=data["max_views_per_day"],
+            max_vc_joins=data["max_vc_joins"],
+            max_channels=data["max_channels"])
+        _owner_flow.pop(q.from_user.id, None)
+
+        try:
+            await q.message.edit_text(
+                f"✅ **Plan Set**\n\n"
+                f"👤 User: `{target}`\n"
+                f"📱 Accounts: `{data['max_accounts']}`\n"
+                f"❤️ Reactions/day: `{data['max_reactions_per_day']}`\n"
+                f"👀 Views/day: `{data['max_views_per_day']}`\n"
+                f"🎤 VC Joins: `{data['max_vc_joins']}`\n"
+                f"📺 Channels: `{data['max_channels']}`\n"
+                f"⏰ Duration: `{duration}`")
+        except Exception:
+            pass
+
+    # ═══════════════════════════════════════════════════
+    # CANCEL
+    # ═══════════════════════════════════════════════════
     @bot.on_message(filters.command("cancel") & filters.user(OWNER_ID))
     async def _cancel(c, m):
         _owner_flow.pop(m.from_user.id, None)
         await m.reply("✅ Cancelled.")
 
+    # ═══════════════════════════════════════════════════
+    # TEXT STEPS — plan flow
+    # ═══════════════════════════════════════════════════
     @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.text,
                     group=-20)
     async def _owner_text(c, m):
@@ -154,6 +217,7 @@ def register(bot):
             return
         step = flow["step"]
 
+        # ─── SET PLAN STEPS ───
         if step == "plan_await_uid":
             try:
                 target = int(txt)
@@ -220,6 +284,7 @@ def register(bot):
                 f"✅ {n}\n\n⏰ **Step 7/7:** Choose duration:",
                 reply_markup=kb)
 
+        # ─── BROADCAST ───
         if step == "await_broadcast":
             _owner_flow.pop(uid, None)
             s = await m.reply("📢 Broadcasting...")
@@ -233,6 +298,7 @@ def register(bot):
                 await asyncio.sleep(0.05)
             await s.edit_text(f"✅ Sent `{ok}` | ❌ `{fail}`")
 
+        # ─── REMOVE PLAN ───
         if step == "plan_await_remove_uid":
             try:
                 target = int(txt)
@@ -245,6 +311,7 @@ def register(bot):
             else:
                 await m.reply(f"⚠️ No plan found for `{target}`")
 
+        # ─── BAN ───
         if step == "ban_await_uid":
             try:
                 target = int(txt)
@@ -254,6 +321,7 @@ def register(bot):
             await ban_user(target, "Manual ban by owner")
             await m.reply(f"🔨 Banned `{target}`")
 
+        # ─── UNBAN ───
         if step == "unban_await_uid":
             try:
                 target = int(txt)
@@ -266,57 +334,9 @@ def register(bot):
             else:
                 await m.reply(f"⚠️ `{target}` was not banned")
 
-@bot.on_callback_query()
-    async def _duration_cb(c, q):
-        # Only handle our duration buttons; ignore everything else
-        if not (q.data or "").startswith("own_dur_"):
-            return
-
-        if q.from_user.id != OWNER_ID:
-            return await q.answer("Owner only.", show_alert=True)
-
-        flow = _owner_flow.get(q.from_user.id)
-        if not flow or flow.get("step") != "plan_await_duration":
-            return await q.answer("Start again with /owner → 💎 Set Plan.",
-                                  show_alert=True)
-
-        raw = q.data.replace("own_dur_", "")   # 1d / 7d / 30d / 90d / life
-        days_map = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "life": 36500}
-        duration = raw
-        days = days_map.get(raw, 30)
-
-        d = flow["data"]
-        target = d["user_id"]
-
-        await set_plan(
-            target,
-            duration=duration,
-            max_accounts=d["max_accounts"],
-            max_reactions_per_day=d["max_reactions_per_day"],
-            max_views_per_day=d["max_views_per_day"],
-            max_vc_joins=d["max_vc_joins"],
-            max_channels=d["max_channels"])
-
-        _owner_flow.pop(q.from_user.id, None)
-
-        pretty = {"1d": "1 day", "7d": "7 days", "30d": "30 days",
-                  "90d": "90 days", "life": "♾ Lifetime"}.get(raw, raw)
-
-        try:
-            await q.message.edit_text(
-                f"✅ **Plan Set**\n\n"
-                f"👤 User: `{target}`\n"
-                f"📱 Accounts: `{d['max_accounts']}`\n"
-                f"❤️ Reactions/day: `{d['max_reactions_per_day']}`\n"
-                f"👀 Views/day: `{d['max_views_per_day']}`\n"
-                f"🎤 VC Joins: `{d['max_vc_joins']}`\n"
-                f"📺 Channels: `{d['max_channels']}`\n"
-                f"⏰ Duration: **{pretty}** ({days} days)")
-        except Exception:
-            pass
-
-        await q.answer(f"✅ Plan set for {pretty}")
-
+    # ═══════════════════════════════════════════════════
+    # BACKGROUND TASKS
+    # ═══════════════════════════════════════════════════
     async def _run_health(m):
         s = await m.reply("🩺 Checking all sessions...")
         accs = await all_accounts()
