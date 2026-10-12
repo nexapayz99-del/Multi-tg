@@ -10,7 +10,7 @@ DURATIONS = {
     "7d": 7,
     "30d": 30,
     "90d": 90,
-    "life": 36500,
+    "life": none,
 }
 
 
