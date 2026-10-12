@@ -5,18 +5,16 @@ from config import OWNER_ID
 
 UNLIMITED = 10**9
 
-# Duration options
 DURATIONS = {
     "1d": 1,
     "7d": 7,
     "30d": 30,
     "90d": 90,
-    "life": None,   # lifetime
+    "life": None,
 }
 
 
 async def is_banned(uid):
-    """Check if user is banned."""
     if uid == OWNER_ID:
         return False
     doc = await banned_users.find_one({"user_id": uid})
@@ -56,10 +54,8 @@ async def get_plan(uid):
         return {"max_accounts": 0, "max_reactions_per_day": 0,
                 "max_views_per_day": 0, "max_vc_joins": 0,
                 "max_channels": 0, "expires_at": None}
-    # Check expiry
     exp = doc.get("expires_at")
     if exp and datetime.utcnow() > exp:
-        # Auto-expire
         await plans.delete_one({"user_id": uid})
         return {"max_accounts": 0, "max_reactions_per_day": 0,
                 "max_views_per_day": 0, "max_vc_joins": 0,
@@ -68,18 +64,13 @@ async def get_plan(uid):
 
 
 async def set_plan(uid, duration="30d", **limits):
-    """
-    Set a plan. duration: "1d","7d","30d","90d","life"
-    limits: max_accounts, max_reactions_per_day, max_views_per_day,
-            max_vc_joins, max_channels
-    """
     days = DURATIONS.get(duration, 30)
     payload = dict(limits)
     payload["user_id"] = uid
     payload["started_at"] = datetime.utcnow()
     payload["duration"] = duration
     if days is None:
-        payload["expires_at"] = None     # lifetime
+        payload["expires_at"] = None
     else:
         payload["expires_at"] = datetime.utcnow() + timedelta(days=days)
     await plans.update_one({"user_id": uid}, {"$set": payload}, upsert=True)
