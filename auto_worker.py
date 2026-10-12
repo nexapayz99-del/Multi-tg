@@ -1,11 +1,4 @@
-"""
-auto_worker.py — v6
-  • Persistent 600-client pool (no repeated logins)
-  • Parallel reactions with stagger to avoid Telegram FloodWait
-  • Views fire before reactions (less spammy)
-  • Drops dead sessions individually
-  • Auto VC worker per channel
-"""
+"""auto_worker.py — persistent pool, fast parallel reactions"""
 import asyncio, random, uuid, time, logging
 from datetime import datetime
 from pyrogram import Client
@@ -22,7 +15,6 @@ logger = logging.getLogger(__name__)
 _running_workers = {}
 _reaction_locks = {}
 
-# ── Persistent client pool ────────────────────────
 MAX_POOL = 600
 _client_pool = {}
 _client_locks = {}
@@ -36,7 +28,6 @@ DEAD_MARKERS = (
 
 
 async def _get_client(phone, session):
-    """Return existing client or create & cache a new one."""
     if phone not in _client_locks:
         _client_locks[phone] = asyncio.Lock()
     async with _client_locks[phone]:
@@ -58,12 +49,10 @@ async def _get_client(phone, session):
         )
         await app.start()
         _client_pool[phone] = app
-        logger.debug(f"pool: +1 ({len(_client_pool)}/{MAX_POOL})")
         return app
 
 
 async def _drop_dead(phone, err=""):
-    """Remove one dead account from DB and pool."""
     from database import accounts
     try:
         await accounts.delete_one({"phone": phone})
@@ -75,7 +64,7 @@ async def _drop_dead(phone, err=""):
             await app.stop()
         except Exception:
             pass
-    logger.warning(f"🗑 Dropped dead {phone} — {err[:80]}")
+    logger.warning(f"🗑 Dropped {phone} — {err[:80]}")
 
 
 def _get_lock(cid, mid):
@@ -93,8 +82,6 @@ async def _get_reactions():
 
 
 async def _react_and_view(app, peer, mid, emoji, cid):
-    """Views first (low spam risk), reaction second."""
-    # ── View ──
     try:
         await app.invoke(GetMessagesViews(peer=peer, id=[mid], increment=True))
     except FloodWait as fw:
@@ -102,7 +89,6 @@ async def _react_and_view(app, peer, mid, emoji, cid):
     except Exception as e:
         logger.debug(f"view fail: {e}")
 
-    # ── Reaction ──
     async with _get_lock(cid, mid):
         try:
             await app.invoke(SendReaction(
@@ -117,10 +103,7 @@ async def _react_and_view(app, peer, mid, emoji, cid):
 
 async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
                              start_delay=0.0):
-    """One account reacts to all new posts. Runs in parallel with others."""
     phone = acc.get("phone")
-
-    # ⭐ Stagger start to avoid FloodWait
     if start_delay > 0:
         await asyncio.sleep(start_delay)
 
@@ -147,14 +130,12 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
                     await _drop_dead(phone, str(e2))
                 return False
 
-        # Fire all reactions for this account in parallel
         tasks = [
             _react_and_view(app, peer, mid, random.choice(reactions), cid)
             for mid in new_ids
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
         return True
-
     except Exception as e:
         err = str(e)
         if any(m in err for m in DEAD_MARKERS):
@@ -166,7 +147,6 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
 
 
 async def process_channel(ch_doc):
-    """Fetch recent posts, react+view on new ones with all accounts."""
     link = ch_doc["link"]
     chat_target = link.strip().rstrip("/")
     accs = await all_accounts()
@@ -175,7 +155,6 @@ async def process_channel(ch_doc):
         return
     reactions = await _get_reactions()
 
-    # ── Fetch recent post IDs ──
     recent_ids, cid = [], None
     try:
         async with Client(
@@ -204,7 +183,6 @@ async def process_channel(ch_doc):
     if not recent_ids or cid is None:
         return
 
-    # ── First scan: mark all as seen (no reactions) ──
     is_first = not await seen_posts.find_one({"chat_id": cid})
     if is_first:
         for mid in recent_ids:
@@ -212,10 +190,9 @@ async def process_channel(ch_doc):
                 {"chat_id": cid, "msg_id": mid},
                 {"$set": {"seen_at": datetime.utcnow()}}, upsert=True)
         logger.info(f"📢 {chat_target}: first scan — "
-                    f"marked {len(recent_ids)} seen (no reaction)")
+                    f"marked {len(recent_ids)} seen")
         return
 
-    # ── Only new posts get reactions ──
     new_ids = []
     for mid in recent_ids:
         seen = await seen_posts.find_one({"chat_id": cid, "msg_id": mid})
@@ -232,8 +209,7 @@ async def process_channel(ch_doc):
                 f"PARALLEL reaction from {len(accs)} accounts")
     t0 = time.time()
 
-    # ⭐ Stagger accounts across a 4-second window
-    STAGGER_WINDOW = 4.0
+    STAGGER_WINDOW = 2.0
     step = STAGGER_WINDOW / max(len(accs), 1)
 
     results = await asyncio.gather(
