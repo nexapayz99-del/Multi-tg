@@ -38,3 +38,9 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
         f"Expected format: 12345:ABC...\n"
         f"Check: {ENV_PATH}"
     )
+# ═══════════════════════════════════════════════════════
+# FSub permanently disabled
+# ═══════════════════════════════════════════════════════
+USE_FSUB = False
+FSUB_CHANNEL_ID = 0
+FSUB_CHANNEL_LINK = ""
