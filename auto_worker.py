@@ -1,8 +1,10 @@
 """
-auto_worker.py — maximum speed with persistent 600-client pool.
-  • Clients stay alive in RAM (only killed on death/error)
-  • Reactions fire in parallel across all accounts
-  • Dead sessions dropped individually
+auto_worker.py — v6
+  • Persistent 600-client pool (no repeated logins)
+  • Parallel reactions with stagger to avoid Telegram FloodWait
+  • Views fire before reactions (less spammy)
+  • Drops dead sessions individually
+  • Auto VC worker per channel
 """
 import asyncio, random, uuid, time, logging
 from datetime import datetime
@@ -20,11 +22,10 @@ logger = logging.getLogger(__name__)
 _running_workers = {}
 _reaction_locks = {}
 
-# ── PERSISTENT CLIENT POOL ─────────────────────
-MAX_POOL = 600            # for 8GB RAM VPS
-_client_pool = {}         # phone -> Client (kept alive)
-_client_locks = {}        # phone -> asyncio.Lock
-_pool_sem = None          # lazy-init semaphore
+# ── Persistent client pool ────────────────────────
+MAX_POOL = 600
+_client_pool = {}
+_client_locks = {}
 
 DEAD_MARKERS = (
     "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
@@ -35,17 +36,18 @@ DEAD_MARKERS = (
 
 
 async def _get_client(phone, session):
-    """Return an existing client from pool, or create+start one."""
+    """Return existing client or create & cache a new one."""
     if phone not in _client_locks:
         _client_locks[phone] = asyncio.Lock()
     async with _client_locks[phone]:
         existing = _client_pool.get(phone)
         if existing and existing.is_connected:
             return existing
-        # Already evicted or broken — kill and recreate
         if existing:
-            try: await existing.stop()
-            except Exception: pass
+            try:
+                await existing.stop()
+            except Exception:
+                pass
             _client_pool.pop(phone, None)
 
         app = Client(
@@ -61,7 +63,7 @@ async def _get_client(phone, session):
 
 
 async def _drop_dead(phone, err=""):
-    """Remove a single account from DB + pool."""
+    """Remove one dead account from DB and pool."""
     from database import accounts
     try:
         await accounts.delete_one({"phone": phone})
@@ -69,8 +71,10 @@ async def _drop_dead(phone, err=""):
         pass
     app = _client_pool.pop(phone, None)
     if app:
-        try: await app.stop()
-        except Exception: pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
     logger.warning(f"🗑 Dropped dead {phone} — {err[:80]}")
 
 
@@ -89,29 +93,37 @@ async def _get_reactions():
 
 
 async def _react_and_view(app, peer, mid, emoji, cid):
-    """React + view on a single message."""
-    # Reaction first (fast)
-    try:
-        await app.invoke(SendReaction(
-            peer=peer, msg_id=mid,
-            reaction=[ReactionEmoji(emoticon=emoji)]
-        ))
-    except FloodWait as fw:
-        await asyncio.sleep(fw.value + 2)
-    except Exception as e:
-        logger.debug(f"react fail: {e}")
-    # View second
+    """Views first (low spam risk), reaction second."""
+    # ── View ──
     try:
         await app.invoke(GetMessagesViews(peer=peer, id=[mid], increment=True))
     except FloodWait as fw:
-        await asyncio.sleep(fw.value + 2)
+        await asyncio.sleep(min(fw.value, 5))
     except Exception as e:
         logger.debug(f"view fail: {e}")
 
+    # ── Reaction ──
+    async with _get_lock(cid, mid):
+        try:
+            await app.invoke(SendReaction(
+                peer=peer, msg_id=mid,
+                reaction=[ReactionEmoji(emoticon=emoji)]
+            ))
+        except FloodWait as fw:
+            await asyncio.sleep(min(fw.value, 5))
+        except Exception as e:
+            logger.debug(f"react fail: {e}")
 
-async def _react_one_account(acc, chat_target, cid, new_ids, reactions):
+
+async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
+                             start_delay=0.0):
     """One account reacts to all new posts. Runs in parallel with others."""
     phone = acc.get("phone")
+
+    # ⭐ Stagger start to avoid FloodWait
+    if start_delay > 0:
+        await asyncio.sleep(start_delay)
+
     try:
         app = await _get_client(phone, acc["session"])
         try:
@@ -121,7 +133,6 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions):
             if any(m in err for m in DEAD_MARKERS):
                 await _drop_dead(phone, err)
                 return False
-            # Try joining then resolving
             try:
                 await app.join_chat(chat_target)
             except UserAlreadyParticipant:
@@ -137,13 +148,13 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions):
                 return False
 
         # Fire all reactions for this account in parallel
-        tasks = []
-        for mid in new_ids:
-            tasks.append(_react_and_view(
-                app, peer, mid, random.choice(reactions), cid
-            ))
+        tasks = [
+            _react_and_view(app, peer, mid, random.choice(reactions), cid)
+            for mid in new_ids
+        ]
         await asyncio.gather(*tasks, return_exceptions=True)
         return True
+
     except Exception as e:
         err = str(e)
         if any(m in err for m in DEAD_MARKERS):
@@ -164,7 +175,7 @@ async def process_channel(ch_doc):
         return
     reactions = await _get_reactions()
 
-    # Fetch recent post IDs
+    # ── Fetch recent post IDs ──
     recent_ids, cid = [], None
     try:
         async with Client(
@@ -193,7 +204,7 @@ async def process_channel(ch_doc):
     if not recent_ids or cid is None:
         return
 
-    # First scan: mark all as seen (no reactions)
+    # ── First scan: mark all as seen (no reactions) ──
     is_first = not await seen_posts.find_one({"chat_id": cid})
     if is_first:
         for mid in recent_ids:
@@ -204,7 +215,7 @@ async def process_channel(ch_doc):
                     f"marked {len(recent_ids)} seen (no reaction)")
         return
 
-    # Only react to new posts
+    # ── Only new posts get reactions ──
     new_ids = []
     for mid in recent_ids:
         seen = await seen_posts.find_one({"chat_id": cid, "msg_id": mid})
@@ -221,12 +232,17 @@ async def process_channel(ch_doc):
                 f"PARALLEL reaction from {len(accs)} accounts")
     t0 = time.time()
 
-    # Fan out across all accounts in parallel
+    # ⭐ Stagger accounts across a 4-second window
+    STAGGER_WINDOW = 4.0
+    step = STAGGER_WINDOW / max(len(accs), 1)
+
     results = await asyncio.gather(
-        *[_react_one_account(a, chat_target, cid, new_ids, reactions)
-          for a in accs],
+        *[_react_one_account(a, chat_target, cid, new_ids, reactions,
+                             start_delay=i * step)
+          for i, a in enumerate(accs)],
         return_exceptions=True,
     )
+
     ok = sum(1 for r in results if r is True)
     fail = len(results) - ok
     logger.info(f"⚡ {chat_target}: done in {time.time()-t0:.1f}s — "
@@ -274,8 +290,10 @@ async def stop_all():
         t.cancel()
     _running_workers.clear()
     for app in _client_pool.values():
-        try: await app.stop()
-        except Exception: pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
     _client_pool.clear()
 
 
