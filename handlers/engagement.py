@@ -1,4 +1,4 @@
-"""handlers/engagement.py — safe VC commands, no collateral damage."""
+"""handlers/engagement.py — no FSub"""
 import asyncio, uuid, base64, logging
 from pyrogram import filters, Client
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 def _is_valid_session(s: str) -> bool:
-    """Fast sanity check — does the session string decode to 271 bytes?"""
     if not s or not isinstance(s, str):
         return False
     try:
@@ -19,6 +18,36 @@ def _is_valid_session(s: str) -> bool:
         return len(raw) == 271
     except Exception:
         return False
+
+
+async def _safe_join_vc(m, target):
+    from vc_joiner import _join_one, ensure_silent
+    ensure_silent()
+    all_accs = await all_accounts()
+    valid = [a for a in all_accs
+             if a.get("session") and _is_valid_session(a["session"])]
+    invalid = len(all_accs) - len(valid)
+    if not valid:
+        return await m.reply("❌ No valid sessions in DB.")
+    s = await m.reply(
+        f"🎤 **Joining VC** `{target}`\n"
+        f"Valid: `{len(valid)}` | Corrupt: `{invalid}`")
+    joined = failed = 0
+    for i, acc in enumerate(valid):
+        cid = await _join_one(acc["phone"], acc["session"], target)
+        if cid:
+            joined += 1
+        else:
+            failed += 1
+        if i % 3 == 0 or i == len(valid) - 1:
+            try:
+                await s.edit_text(
+                    f"🎤 **Joining VC** `{target}`\n"
+                    f"✅ `{joined}` ❌ `{failed}` ({i+1}/{len(valid)})")
+            except Exception:
+                pass
+        await asyncio.sleep(2)
+    await s.edit_text(f"🏁 **VC Join Complete**\n✅ `{joined}` ❌ `{failed}`")
 
 
 def register(bot):
@@ -75,9 +104,12 @@ def register(bot):
         try:
             from auto_worker import stop_channel_worker
             await stop_channel_worker(link)
-        except Exception: pass
-        try: await q.message.edit_text(f"✅ Removed `{link}`")
-        except Exception: await q.answer("Removed.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await q.message.edit_text(f"✅ Removed `{link}`")
+        except Exception:
+            await q.answer("Removed.", show_alert=True)
 
     @bot.on_message(filters.command("joinvc"))
     async def _joinvc(c, m):
@@ -87,43 +119,7 @@ def register(bot):
         parts = m.text.split(maxsplit=1)
         if len(parts) < 2:
             return await m.reply("Usage: `/joinvc <channel_link>`")
-        target = parts[1].strip()
-        await _safe_join_vc(m, target)
-
-    async def _safe_join_vc(m, target):
-        """Join VC with all valid sessions. Never kills other sessions."""
-        from vc_joiner import _join_one, ensure_silent
-        ensure_silent()
-
-        all_accs = await all_accounts()
-        valid = [a for a in all_accs if a.get("session") and _is_valid_session(a["session"])]
-        invalid = len(all_accs) - len(valid)
-        logger.info(f"VC join: {len(valid)} valid / {invalid} corrupt sessions")
-
-        if not valid:
-            return await m.reply("❌ No valid sessions in DB.")
-
-        s = await m.reply(
-            f"🎤 **Joining VC** `{target}`\n"
-            f"Valid sessions: `{len(valid)}`\n"
-            f"Corrupt skipped: `{invalid}`")
-        joined = failed = 0
-        for i, acc in enumerate(valid):
-            cid = await _join_one(acc["phone"], acc["session"], target)
-            if cid:
-                joined += 1
-            else:
-                failed += 1
-            if i % 3 == 0 or i == len(valid) - 1:
-                try:
-                    await s.edit_text(
-                        f"🎤 **Joining VC** `{target}`\n"
-                        f"✅ `{joined}` ❌ `{failed}` ({i+1}/{len(valid)})")
-                except Exception:
-                    pass
-            await asyncio.sleep(2)  # fast pacing
-        await s.edit_text(
-            f"🏁 **VC Join Complete**\n✅ `{joined}` ❌ `{failed}`")
+        await _safe_join_vc(m, parts[1].strip())
 
     @bot.on_message(filters.command("leavevc"))
     async def _leavevc(c, m):
@@ -145,7 +141,8 @@ def register(bot):
         target = parts[1].strip()
         s = await m.reply(f"🔗 Joining `{target}`...")
         accs = await all_accounts()
-        accs = [a for a in accs if a.get("session") and _is_valid_session(a["session"])]
+        accs = [a for a in accs
+                if a.get("session") and _is_valid_session(a["session"])]
         if not accs:
             return await s.edit_text("❌ No valid sessions.")
         ok = fail = already = 0
@@ -191,7 +188,8 @@ def register(bot):
         target = parts[1].strip()
         s = await m.reply(f"🚪 Leaving `{target}`...")
         accs = await all_accounts()
-        accs = [a for a in accs if a.get("session") and _is_valid_session(a["session"])]
+        accs = [a for a in accs
+                if a.get("session") and _is_valid_session(a["session"])]
         if not accs:
             return await s.edit_text("❌ No valid sessions.")
         ok = fail = 0
@@ -199,43 +197,4 @@ def register(bot):
             app = None
             try:
                 app = Client(f"ll_{uuid.uuid4().hex[:6]}",
-                             api_id=API_ID, api_hash=API_HASH,
-                             session_string=acc["session"],
-                             in_memory=True, no_updates=True)
-                await app.start()
-                try:
-                    chat = await app.get_chat(target)
-                    await app.leave_chat(chat.id); ok += 1
-                except Exception:
-                    fail += 1
-            except Exception:
-                fail += 1
-            finally:
-                if app:
-                    try: await app.stop()
-                    except Exception: pass
-            if i % 5 == 0 or i == len(accs) - 1:
-                try:
-                    await s.edit_text(
-                        f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
-                except Exception: pass
-        await s.edit_text(f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
-
-    @bot.on_message(filters.private, group=-3)
-    async def _state(c, m):
-        ud = getattr(c, "user_data", {})
-        st = ud.get(m.from_user.id)
-        if not st or not isinstance(st, dict): return
-        if st.get("step") == "channel_link" and m.text:
-            link = m.text.strip()
-            if "t.me/" not in link and not link.startswith("@"):
-                return await m.reply("❌ Invalid link.")
-            await auto_channels.update_one(
-                {"link": link},
-                {"$set": {"link": link, "added_by": m.from_user.id}},
-                upsert=True)
-            ud.pop(m.from_user.id, None)
-            await m.reply(
-                f"✅ Added `{link}`.\n"
-                f"First scan will just mark existing posts.\n"
-                f"New posts + VC auto-handled within 20s.")
+                             api_id=API_ID, api_hash=
