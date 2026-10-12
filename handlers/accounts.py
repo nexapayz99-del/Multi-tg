@@ -60,7 +60,8 @@ def register(bot):
     async def _states(c, m):
         ud = getattr(c, "user_data", {})
         st = ud.get(m.from_user.id)
-        if not st: return
+        if not st:
+            return
         step = st.get("step") if isinstance(st, dict) else None
 
         if step == "import_file" and (m.document or m.text):
@@ -71,7 +72,8 @@ def register(bot):
                 os.makedirs(tmp, exist_ok=True)
                 try:
                     if path.lower().endswith(".zip"):
-                        with zipfile.ZipFile(path) as z: z.extractall(tmp)
+                        with zipfile.ZipFile(path) as z:
+                            z.extractall(tmp)
                         ok, fail = await import_zip(path, m.from_user.id)
                     else:
                         shutil.copy2(path, os.path.join(tmp, os.path.basename(path)))
