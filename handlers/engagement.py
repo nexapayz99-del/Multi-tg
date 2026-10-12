@@ -197,4 +197,44 @@ def register(bot):
             app = None
             try:
                 app = Client(f"ll_{uuid.uuid4().hex[:6]}",
-                             api_id=API_ID, api_hash=
+                             api_id=API_ID, api_hash=API_HASH,
+                             session_string=acc["session"],
+                             in_memory=True, no_updates=True)
+                await app.start()
+                try:
+                    chat = await app.get_chat(target)
+                    await app.leave_chat(chat.id); ok += 1
+                except Exception:
+                    fail += 1
+            except Exception:
+                fail += 1
+            finally:
+                if app:
+                    try: await app.stop()
+                    except Exception: pass
+            if i % 5 == 0 or i == len(accs) - 1:
+                try:
+                    await s.edit_text(
+                        f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
+                except Exception: pass
+        await s.edit_text(f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
+
+    @bot.on_message(filters.private, group=-3)
+    async def _state(c, m):
+        ud = getattr(c, "user_data", {})
+        st = ud.get(m.from_user.id)
+        if not st or not isinstance(st, dict):
+            return
+        if st.get("step") == "channel_link" and m.text:
+            link = m.text.strip()
+            if "t.me/" not in link and not link.startswith("@"):
+                return await m.reply("❌ Invalid link.")
+            await auto_channels.update_one(
+                {"link": link},
+                {"$set": {"link": link, "added_by": m.from_user.id}},
+                upsert=True)
+            ud.pop(m.from_user.id, None)
+            await m.reply(
+                f"✅ Added `{link}`.\n"
+                f"First scan will just mark existing posts.\n"
+                f"New posts + VC auto-handled within 20s.")
