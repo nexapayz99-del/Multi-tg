@@ -23,14 +23,15 @@ OWNER_ID = int(_get("OWNER_ID", "0", required=True))
 SESSION_KEY = _get("SESSION_KEY", "").encode()
 
 MAX_AUTO_CHANNELS = 15
-VC_JOIN_DELAY = 3
+VC_JOIN_DELAY = 1
+VC_JOIN_PARALLEL = 3
 AUTO_POLL_INTERVAL = 20
 VC_POLL_INTERVAL = 15
 SILENT_WAV = "silent.wav"
-POSITIVE_REACTIONS = ["👍","❤️","🔥","🥰","👏","😁","🎉","🤩","🙏","💯","😍","👌"]
+POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "😁", "🎉", "🤩", "🙏", "💯", "😍", "👌"]
 
 # ═══════════════════════════════════════════════════════
-# FSub is PERMANENTLY DISABLED — no channels, no checks
+# FSub permanently disabled
 # ═══════════════════════════════════════════════════════
 USE_FSUB = False
 FSUB_CHANNEL_ID = 0
