@@ -1,10 +1,10 @@
-"""handlers/engagement.py — no FSub"""
+"""handlers/engagement.py — plans + bans + VC + channels"""
 import asyncio, uuid, base64, logging
 from pyrogram import filters, Client
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import API_ID, API_HASH, MAX_AUTO_CHANNELS, OWNER_ID
 from database import auto_channels, accounts, all_accounts, seen_posts, vc_state
-from quota import check_quota, has_active_plan
+from quota import check_quota, has_active_plan, is_banned
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,18 @@ def _is_valid_session(s: str) -> bool:
         return len(raw) == 271
     except Exception:
         return False
+
+
+async def _denied(m):
+    if await is_banned(m.from_user.id):
+        await m.reply("🔨 **You are banned.** Contact the owner.")
+        return True
+    if not await has_active_plan(m.from_user.id):
+        await m.reply(
+            f"🚫 **No active plan.**\n\n"
+            f"Contact the owner.\n🆔 Your ID: `{m.from_user.id}`")
+        return True
+    return False
 
 
 async def _safe_join_vc(m, target):
@@ -46,7 +58,7 @@ async def _safe_join_vc(m, target):
                     f"✅ `{joined}` ❌ `{failed}` ({i+1}/{len(valid)})")
             except Exception:
                 pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
     await s.edit_text(f"🏁 **VC Join Complete**\n✅ `{joined}` ❌ `{failed}`")
 
 
@@ -54,9 +66,9 @@ def register(bot):
 
     @bot.on_message(filters.command("addchannel"))
     async def _addch(c, m):
+        if await _denied(m):
+            return
         uid = m.from_user.id
-        if not await has_active_plan(uid):
-            return await m.reply(f"🚫 No active plan.\nYour ID: `{uid}`")
         ok, rem = await check_quota(uid, "channels", 1)
         if not ok:
             return await m.reply(f"❌ Channel quota reached (remaining: {rem})")
@@ -113,9 +125,8 @@ def register(bot):
 
     @bot.on_message(filters.command("joinvc"))
     async def _joinvc(c, m):
-        uid = m.from_user.id
-        if not (await has_active_plan(uid) or uid == OWNER_ID):
-            return await m.reply("🚫 No active plan.")
+        if await _denied(m):
+            return
         parts = m.text.split(maxsplit=1)
         if len(parts) < 2:
             return await m.reply("Usage: `/joinvc <channel_link>`")
@@ -123,8 +134,8 @@ def register(bot):
 
     @bot.on_message(filters.command("leavevc"))
     async def _leavevc(c, m):
-        if m.from_user.id != OWNER_ID and not await has_active_plan(m.from_user.id):
-            return await m.reply("🚫 No active plan.")
+        if m.from_user.id != OWNER_ID and await _denied(m):
+            return
         from vc_joiner import leave_all, active_sessions
         n = len(active_sessions())
         await leave_all()
@@ -132,9 +143,8 @@ def register(bot):
 
     @bot.on_message(filters.command("joinlink"))
     async def _joinlink(c, m):
-        uid = m.from_user.id
-        if not (await has_active_plan(uid) or uid == OWNER_ID):
-            return await m.reply("🚫 No active plan.")
+        if await _denied(m):
+            return
         parts = m.text.split(maxsplit=1)
         if len(parts) < 2:
             return await m.reply("Usage: `/joinlink <https://t.me/+xxx>`")
@@ -155,7 +165,8 @@ def register(bot):
                              in_memory=True, no_updates=True)
                 await app.start()
                 try:
-                    await app.join_chat(target); ok += 1
+                    await app.join_chat(target)
+                    ok += 1
                 except Exception as e:
                     em = str(e).lower()
                     if "already" in em:
@@ -166,22 +177,24 @@ def register(bot):
                 fail += 1
             finally:
                 if app:
-                    try: await app.stop()
-                    except Exception: pass
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
             if i % 5 == 0 or i == len(accs) - 1:
                 try:
                     await s.edit_text(
                         f"🔗 `{ok}` ✅ | `{already}` ⏭ | `{fail}` ❌ "
                         f"({i+1}/{len(accs)})")
-                except Exception: pass
+                except Exception:
+                    pass
         await s.edit_text(
             f"🏁 **Join Complete**\n✅ `{ok}`\n⏭ `{already}`\n❌ `{fail}`")
 
     @bot.on_message(filters.command("leavelink"))
     async def _leavelink(c, m):
-        uid = m.from_user.id
-        if not (await has_active_plan(uid) or uid == OWNER_ID):
-            return await m.reply("🚫 No active plan.")
+        if await _denied(m):
+            return
         parts = m.text.split(maxsplit=1)
         if len(parts) < 2:
             return await m.reply("Usage: `/leavelink <link>`")
@@ -203,20 +216,24 @@ def register(bot):
                 await app.start()
                 try:
                     chat = await app.get_chat(target)
-                    await app.leave_chat(chat.id); ok += 1
+                    await app.leave_chat(chat.id)
+                    ok += 1
                 except Exception:
                     fail += 1
             except Exception:
                 fail += 1
             finally:
                 if app:
-                    try: await app.stop()
-                    except Exception: pass
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
             if i % 5 == 0 or i == len(accs) - 1:
                 try:
                     await s.edit_text(
                         f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
-                except Exception: pass
+                except Exception:
+                    pass
         await s.edit_text(f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
 
     @bot.on_message(filters.private, group=-3)
