@@ -6,7 +6,7 @@ from pyrogram.types import (
 )
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 from database import users, accounts, all_accounts, auto_channels
-from quota import reset_daily, has_active_plan, check_quota, get_plan
+from quota import reset_daily, has_active_plan, check_quota, get_plan, is_banned
 import auto_worker
 from vc_joiner import ensure_silent, leave_all, active_sessions
 
@@ -42,11 +42,19 @@ def main_menu(uid):
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
+async def force_join_check(c, m_or_cb):
+    return True
+
+
 @bot.on_message(filters.command("start") & filters.private)
 async def _start(c, m):
     uid = m.from_user.id
     await users.update_one({"user_id": uid},
         {"$setOnInsert": {"user_id": uid}}, upsert=True)
+    if await is_banned(uid):
+        return await m.reply(
+            "🔨 **You are banned from using this bot.**\n\n"
+            f"🆔 Your ID: `{uid}`")
     if not await has_active_plan(uid):
         return await m.reply(
             f"👋 **Welcome {m.from_user.first_name}**\n\n"
@@ -59,9 +67,6 @@ async def _start(c, m):
         reply_markup=main_menu(uid))
 
 
-# ─────────────────────────────────────────────────────────
-# BUTTONS
-# ─────────────────────────────────────────────────────────
 @bot.on_message(filters.private & filters.regex("^📱 Add Account$"))
 async def _btn_addacc(c, m):
     from handlers.accounts import _addacc_impl
@@ -71,6 +76,8 @@ async def _btn_addacc(c, m):
 @bot.on_message(filters.private & filters.regex("^📦 Import$"))
 async def _btn_import(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
@@ -81,6 +88,8 @@ async def _btn_import(c, m):
 @bot.on_message(filters.private & filters.regex("^🎭 Randomize$"))
 async def _btn_randomize(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
@@ -108,6 +117,8 @@ async def _btn_myaccts(c, m):
 @bot.on_message(filters.private & filters.regex("^📺 Add Channel$"))
 async def _btn_addchan(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply(f"🚫 No active plan.\nYour ID: `{uid}`")
     ok, rem = await check_quota(uid, "channels", 1)
@@ -142,6 +153,8 @@ async def _btn_channels(c, m):
 @bot.on_message(filters.private & filters.regex("^🎤 Join VC$"))
 async def _btn_joinvc(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
@@ -165,6 +178,8 @@ async def _btn_leavevc(c, m):
 @bot.on_message(filters.private & filters.regex("^🔗 Join via Link$"))
 async def _btn_joinlink(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
@@ -178,6 +193,8 @@ async def _btn_joinlink(c, m):
 @bot.on_message(filters.private & filters.regex("^🚪 Leave Link$"))
 async def _btn_leavelink(c, m):
     uid = m.from_user.id
+    if await is_banned(uid):
+        return await m.reply("🔨 Banned.")
     if not await has_active_plan(uid):
         return await m.reply("🚫 No active plan.")
     c.user_data = getattr(c, "user_data", {})
@@ -187,14 +204,21 @@ async def _btn_leavelink(c, m):
 
 @bot.on_message(filters.private & filters.regex("^💎 My Plan$"))
 async def _btn_myplan(c, m):
+    from datetime import datetime
     p = await get_plan(m.from_user.id)
+    if not p or p.get("max_accounts") in (None, 0):
+        return await m.reply("💎 **No active plan.** Contact the owner.")
+    exp = p.get("expires_at")
+    exp_line = (f"⏰ Expires: `{exp.strftime('%Y-%m-%d')}`"
+                if exp else "⏰ Duration: `♾ Lifetime`")
     await m.reply(
         f"💎 **Your Plan**\n\n"
         f"📱 Max Accounts: `{p.get('max_accounts',0)}`\n"
         f"❤️ Reactions/day: `{p.get('max_reactions_per_day',0)}`\n"
         f"👀 Views/day: `{p.get('max_views_per_day',0)}`\n"
         f"🎤 VC Joins: `{p.get('max_vc_joins',0)}`\n"
-        f"📺 Channels: `{p.get('max_channels',0)}`")
+        f"📺 Channels: `{p.get('max_channels',0)}`\n"
+        f"{exp_line}")
 
 
 @bot.on_message(filters.private & filters.regex("^🩺 Health$"))
@@ -208,15 +232,16 @@ async def _btn_health(c, m):
 async def _btn_ownerpanel(c, m):
     if m.from_user.id != OWNER_ID:
         return await m.reply("👑 Owner only.")
-    await _do_owner_panel(c, m)
-
-
-async def _do_owner_panel(c, m):
+    from handlers.owner import register
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Stats", callback_data="own_stats")],
-        [InlineKeyboardButton("💎 Set Plan for User", callback_data="own_setplan")],
         [InlineKeyboardButton("📋 List All Plans", callback_data="own_listplans")],
-        [InlineKeyboardButton("🚫 Remove User Plan", callback_data="own_delplan")],
+        [InlineKeyboardButton("💎 Set Plan", callback_data="own_setplan")],
+        [InlineKeyboardButton("🚫 Remove Plan", callback_data="own_delplan")],
+        [InlineKeyboardButton("👤 List Users", callback_data="own_listusers")],
+        [InlineKeyboardButton("🔨 Ban User", callback_data="own_ban"),
+         InlineKeyboardButton("✅ Unban User", callback_data="own_unban")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="own_broadcast")],
         [InlineKeyboardButton("🩺 Health Check", callback_data="own_health")],
         [InlineKeyboardButton("🗑 Clean Dead Sessions", callback_data="own_clean")],
@@ -244,9 +269,6 @@ async def _do_health(c, m):
     await s.edit_text(f"🏁 Alive: `{ok}` | 💀 Removed: `{dead}`")
 
 
-# ─────────────────────────────────────────────────────────
-# TEXT INPUT HANDLERS FOR VC / LINK
-# ─────────────────────────────────────────────────────────
 @bot.on_message(filters.private & filters.text, group=5)
 async def _text_states(c, m):
     ud = getattr(c, "user_data", {})
@@ -284,7 +306,8 @@ async def _text_states(c, m):
                              in_memory=True, no_updates=True)
                 await app.start()
                 try:
-                    await app.join_chat(txt); ok += 1
+                    await app.join_chat(txt)
+                    ok += 1
                 except Exception as e:
                     em = str(e).lower()
                     if "already" in em:
@@ -295,14 +318,17 @@ async def _text_states(c, m):
                 fail += 1
             finally:
                 if app:
-                    try: await app.stop()
-                    except Exception: pass
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
             if i % 5 == 0 or i == len(accs) - 1:
                 try:
                     await s.edit_text(
                         f"🔗 `{ok}` ✅ | `{already}` ⏭ | `{fail}` ❌ "
                         f"({i+1}/{len(accs)})")
-                except Exception: pass
+                except Exception:
+                    pass
         return await s.edit_text(
             f"🏁 **Join Complete**\n✅ `{ok}`\n⏭ `{already}`\n❌ `{fail}`")
 
@@ -327,25 +353,28 @@ async def _text_states(c, m):
                 await app.start()
                 try:
                     chat = await app.get_chat(txt)
-                    await app.leave_chat(chat.id); ok += 1
+                    await app.leave_chat(chat.id)
+                    ok += 1
                 except Exception:
                     fail += 1
             except Exception:
                 fail += 1
             finally:
                 if app:
-                    try: await app.stop()
-                    except Exception: pass
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
             if i % 5 == 0 or i == len(accs) - 1:
                 try:
                     await s.edit_text(
                         f"🚪 `{ok}` ✅ ❌ `{fail}` ({i+1}/{len(accs)})")
-                except Exception: pass
+                except Exception:
+                    pass
         return await s.edit_text(
             f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
 
 
-# ─────────────────────────────────────────────────────────
 async def _daily_reset():
     while True:
         await asyncio.sleep(86400)
