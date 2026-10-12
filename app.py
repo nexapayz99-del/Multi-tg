@@ -42,6 +42,14 @@ def main_menu(uid):
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
+# ─────────────────────────────────────────────────────────
+# FSub check — PERMANENTLY DISABLED
+# If any handler accidentally calls this, it always returns True
+# ─────────────────────────────────────────────────────────
+async def force_join_check(c, m_or_cb):
+    return True
+
+
 @bot.on_message(filters.command("start") & filters.private)
 async def _start(c, m):
     uid = m.from_user.id
@@ -268,7 +276,7 @@ async def _text_states(c, m):
     if step == "joinlink_input":
         ud.pop(m.from_user.id, None)
         s = await m.reply(f"🔗 Joining `{txt}` with all accounts...")
-        import base64, uuid
+        import uuid
         from handlers.engagement import _is_valid_session
         accs = await all_accounts()
         accs = [a for a in accs
