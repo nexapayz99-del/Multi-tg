@@ -266,15 +266,25 @@ def register(bot):
             else:
                 await m.reply(f"⚠️ `{target}` was not banned")
 
-    @bot.on_callback_query(filters.regex("^own_dur_"))
+@bot.on_callback_query()
     async def _duration_cb(c, q):
+        # Only handle our duration buttons; ignore everything else
+        if not (q.data or "").startswith("own_dur_"):
+            return
+
         if q.from_user.id != OWNER_ID:
             return await q.answer("Owner only.", show_alert=True)
+
         flow = _owner_flow.get(q.from_user.id)
         if not flow or flow.get("step") != "plan_await_duration":
             return await q.answer("Start again with /owner → 💎 Set Plan.",
                                   show_alert=True)
-        duration = q.data.replace("own_dur_", "")
+
+        raw = q.data.replace("own_dur_", "")   # 1d / 7d / 30d / 90d / life
+        days_map = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "life": 36500}
+        duration = raw
+        days = days_map.get(raw, 30)
+
         d = flow["data"]
         target = d["user_id"]
 
@@ -286,7 +296,11 @@ def register(bot):
             max_views_per_day=d["max_views_per_day"],
             max_vc_joins=d["max_vc_joins"],
             max_channels=d["max_channels"])
+
         _owner_flow.pop(q.from_user.id, None)
+
+        pretty = {"1d": "1 day", "7d": "7 days", "30d": "30 days",
+                  "90d": "90 days", "life": "♾ Lifetime"}.get(raw, raw)
 
         try:
             await q.message.edit_text(
@@ -297,9 +311,11 @@ def register(bot):
                 f"👀 Views/day: `{d['max_views_per_day']}`\n"
                 f"🎤 VC Joins: `{d['max_vc_joins']}`\n"
                 f"📺 Channels: `{d['max_channels']}`\n"
-                f"⏰ Duration: `{duration}`")
+                f"⏰ Duration: **{pretty}** ({days} days)")
         except Exception:
             pass
+
+        await q.answer(f"✅ Plan set for {pretty}")
 
     async def _run_health(m):
         s = await m.reply("🩺 Checking all sessions...")
