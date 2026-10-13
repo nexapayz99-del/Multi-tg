@@ -5,62 +5,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import API_ID, API_HASH, MAX_AUTO_CHANNELS, OWNER_ID
 from database import auto_channels, accounts, all_accounts, seen_posts, vc_state
 from quota import check_quota, has_active_plan, is_banned
-async def _join_link_bulk(m, target: str, leave: bool = False):
-    """Bulk join or leave a group/channel with all accounts."""
-    action = "🚪 Leaving" if leave else "🔗 Joining"
-    s = await m.reply(f"{action} `{target}` with all accounts...")
-    accs = await all_accounts()
-    accs = [a for a in accs if a.get("session") and _is_valid_session(a["session"])]
-    if not accs:
-        return await s.edit_text("❌ No valid sessions.")
-    ok = fail = already = 0
-    for i, acc in enumerate(accs):
-        app = None
-        try:
-            app = Client(f"lnk_{uuid.uuid4().hex[:6]}",
-                         api_id=API_ID, api_hash=API_HASH,
-                         session_string=acc["session"],
-                         in_memory=True, no_updates=True)
-            await app.start()
-            if leave:
-                try:
-                    chat = await app.get_chat(target)
-                    await app.leave_chat(chat.id)
-                    ok += 1
-                except Exception:
-                    fail += 1
-            else:
-                try:
-                    await app.join_chat(target)
-                    ok += 1
-                except Exception as e:
-                    em = str(e).lower()
-                    if "already" in em:
-                        already += 1
-                    else:
-                        fail += 1
-        except Exception:
-            fail += 1
-        finally:
-            if app:
-                try:
-                    await app.stop()
-                except Exception:
-                    pass
-        if i % 5 == 0 or i == len(accs) - 1:
-            try:
-                await s.edit_text(
-                    f"{action} `{target}`\n"
-                    f"✅ `{ok}` | ⏭ `{already}` | ❌ `{fail}` "
-                    f"({i+1}/{len(accs)})")
-            except Exception:
-                pass
-    if leave:
-        await s.edit_text(f"🏁 **Leave Complete**\n✅ `{ok}` ❌ `{fail}`")
-    else:
-        await s.edit_text(
-            f"🏁 **Join Complete**\n✅ `{ok}`\n⏭ `{already}`\n❌ `{fail}`")
-            
+
 logger = logging.getLogger(__name__)
 
 
