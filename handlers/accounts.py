@@ -4,7 +4,9 @@ from pyrogram.errors import SessionPasswordNeeded
 from config import API_ID, API_HASH, OWNER_ID
 from database import all_accounts, save_account
 from quota import check_quota, has_active_plan, is_banned
-from session_manager import import_any_string, import_file, import_zip
+from session_manager import (
+    import_any_string, import_any_file, import_file, import_zip,
+)
 from indian_randomizer import apply_randomizer
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,15 @@ def register(bot):
             return await m.reply("🚫 No active plan.")
         c.user_data = getattr(c, "user_data", {})
         c.user_data[m.from_user.id] = {"step": "import_file"}
-        await m.reply("📦 Send zip/session/json/txt or session string.")
+        await m.reply(
+            "📦 **Send your file**\n\n"
+            "Supported formats:\n"
+            "• `.zip` with any mix of files\n"
+            "• `.session` (Telethon SQLite)\n"
+            "• `.json` (Telethon / Pyrogram / custom)\n"
+            "• `.txt` (one session string per line)\n"
+            "• `.hex` (raw auth key)\n"
+            "• Or paste a session string directly")
 
     @bot.on_message(filters.command("randomize"))
     async def _randomize(c, m):
@@ -71,18 +81,22 @@ def register(bot):
             return
         step = st.get("step") if isinstance(st, dict) else None
 
+        # ═══════════════════════════════════════════════════
+        # FILE IMPORT — supports .zip, .session, .json, .txt, .hex
+        # ═══════════════════════════════════════════════════
         if step == "import_file" and (m.document or m.text):
             if m.document:
-                s = await m.reply("⏳ Downloading...")
+                s = await m.reply("⏳ Downloading and importing...")
                 path = await m.download()
                 try:
-                    from session_manager import import_any_file
                     ok, fail = await import_any_file(path, m.from_user.id)
                     await s.edit_text(
-                        f"✅ Imported: `{ok}` | ❌ `{fail}`\n\n"
-                        f"_If 0 imported, ensure the file contains "
-                        f"valid session strings or .session SQLite files._")
+                        f"🏁 **Import Complete**\n\n"
+                        f"✅ Imported: `{ok}`\n"
+                        f"❌ Failed: `{fail}`\n\n"
+                        f"_Note: expired/dead sessions are counted as failed._")
                 except Exception as e:
+                    logger.exception(f"import error: {e}")
                     await s.edit_text(f"❌ Import error: `{e}`")
                 finally:
                     try:
@@ -91,26 +105,19 @@ def register(bot):
                         pass
                 ud.pop(m.from_user.id, None)
                 return
-            if m.text and await import_any_string(m.text.strip(), m.from_user.id):
-                await m.reply("✅ Session imported.")
-            else:
-                await m.reply("❌ Invalid session.")
-            ud.pop(m.from_user.id, None)
-            return
-                    try:
-                        os.remove(path)
-                    except Exception:
-                        pass
-                    shutil.rmtree(tmp, ignore_errors=True)
+
+            # Text message — try raw session string
+            if m.text:
+                if await import_any_string(m.text.strip(), m.from_user.id):
+                    await m.reply("✅ Session imported.")
+                else:
+                    await m.reply("❌ Invalid session string.")
                 ud.pop(m.from_user.id, None)
                 return
-            if m.text and await import_any_string(m.text.strip(), m.from_user.id):
-                await m.reply("✅ Session imported.")
-            else:
-                await m.reply("❌ Invalid session.")
-            ud.pop(m.from_user.id, None)
-            return
 
+        # ═══════════════════════════════════════════════════
+        # RANDOMIZER
+        # ═══════════════════════════════════════════════════
         if step == "randomizer_zip" and m.document:
             s = await m.reply("⏳ Applying...")
             path = await m.download()
@@ -130,6 +137,9 @@ def register(bot):
             ud.pop(m.from_user.id, None)
             return
 
+        # ═══════════════════════════════════════════════════
+        # LOGIN FLOW
+        # ═══════════════════════════════════════════════════
         if step == "phone" and m.text:
             try:
                 temp = Client(f"temp_{uuid.uuid4().hex[:6]}",
@@ -137,8 +147,12 @@ def register(bot):
                               in_memory=True, no_updates=True)
                 await temp.connect()
                 co = await temp.send_code(m.text.strip())
-                ud[m.from_user.id] = {"step": "code", "phone": m.text.strip(),
-                                      "hash": co.phone_code_hash, "client": temp}
+                ud[m.from_user.id] = {
+                    "step": "code",
+                    "phone": m.text.strip(),
+                    "hash": co.phone_code_hash,
+                    "client": temp,
+                }
                 await m.reply("📩 Enter OTP:")
             except Exception as e:
                 await m.reply(f"❌ {e}")
@@ -174,7 +188,8 @@ def register(bot):
         phone = ud[m.from_user.id]["phone"]
         ss = await temp.export_session_string()
         me = await temp.get_me()
-        await save_account(phone, ss, me.first_name, m.from_user.id, {"id": me.id})
+        await save_account(phone, ss, me.first_name, m.from_user.id,
+                           {"id": me.id})
         await m.reply(f"✅ Logged in as **{me.first_name}**")
         try:
             await temp.disconnect()
