@@ -9,6 +9,7 @@ from database import users, accounts, all_accounts, auto_channels
 from quota import reset_daily, has_active_plan, check_quota, get_plan, is_banned
 import auto_worker
 from vc_joiner import ensure_silent, leave_all, active_sessions
+from utils.proxy import get_proxy
 
 import handlers.owner, handlers.accounts, handlers.engagement
 import handlers.plans, handlers.broadcast
@@ -28,7 +29,8 @@ for _noisy in (
 log = logging.getLogger("bot")
 
 bot = Client("multi_manager_bot",
-             api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+             api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+             proxy=get_proxy())
 
 handlers.owner.register(bot)
 handlers.accounts.register(bot)
@@ -269,7 +271,8 @@ async def _do_health(c, m):
             async with Client(f"h_{uuid.uuid4().hex[:6]}",
                               api_id=API_ID, api_hash=API_HASH,
                               session_string=a["session"],
-                              in_memory=True, no_updates=True) as app:
+                              in_memory=True, no_updates=True,
+                              proxy=get_proxy()) as app:
                 await app.get_me()
                 ok += 1
         except Exception:
@@ -312,7 +315,8 @@ async def _text_states(c, m):
                 app = Client(f"jl_{uuid.uuid4().hex[:6]}",
                              api_id=API_ID, api_hash=API_HASH,
                              session_string=acc["session"],
-                             in_memory=True, no_updates=True)
+                             in_memory=True, no_updates=True,
+                             proxy=get_proxy())
                 await app.start()
                 try:
                     await app.join_chat(txt)
@@ -358,7 +362,8 @@ async def _text_states(c, m):
                 app = Client(f"ll_{uuid.uuid4().hex[:6]}",
                              api_id=API_ID, api_hash=API_HASH,
                              session_string=acc["session"],
-                             in_memory=True, no_updates=True)
+                             in_memory=True, no_updates=True,
+                             proxy=get_proxy())
                 await app.start()
                 try:
                     chat = await app.get_chat(txt)
