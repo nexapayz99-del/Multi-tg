@@ -8,6 +8,7 @@ from session_manager import (
     import_any_string, import_any_file, import_file, import_zip,
 )
 from indian_randomizer import apply_randomizer
+from utils.proxy import get_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,8 @@ def register(bot):
             try:
                 temp = Client(f"temp_{uuid.uuid4().hex[:6]}",
                               api_id=API_ID, api_hash=API_HASH,
-                              in_memory=True, no_updates=True)
+                              in_memory=True, no_updates=True,
+                              proxy=get_proxy())
                 await temp.connect()
                 co = await temp.send_code(m.text.strip())
                 ud[m.from_user.id] = {
