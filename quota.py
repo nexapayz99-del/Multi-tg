@@ -1,17 +1,10 @@
-"""quota.py — plans with duration, bans"""
+"""quota.py — plans, bans, admin check"""
 from datetime import datetime, timedelta
-from database import plans, accounts, auto_channels, banned_users
+from database import plans, accounts, auto_channels, banned_users, admins
 from config import OWNER_ID
 
 UNLIMITED = 10**9
-
-DURATIONS = {
-    "1d": 1,
-    "7d": 7,
-    "30d": 30,
-    "90d": 90,
-    "life": None,
-}
+DURATIONS = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "life": None}
 
 
 async def is_banned(uid):
@@ -34,6 +27,13 @@ async def unban_user(uid):
     return r.deleted_count > 0
 
 
+async def is_admin(uid):
+    if uid == OWNER_ID:
+        return True
+    doc = await admins.find_one({"user_id": uid})
+    return bool(doc)
+
+
 def _has_plan_shape(plan):
     return plan and plan.get("max_accounts") not in (None, 0)
 
@@ -41,13 +41,9 @@ def _has_plan_shape(plan):
 async def get_plan(uid):
     if uid == OWNER_ID:
         return {
-            "max_accounts": UNLIMITED,
-            "max_reactions_per_day": UNLIMITED,
-            "max_views_per_day": UNLIMITED,
-            "max_vc_joins": UNLIMITED,
-            "max_channels": UNLIMITED,
-            "expires_at": None,
-            "owner": True,
+            "max_accounts": UNLIMITED, "max_reactions_per_day": UNLIMITED,
+            "max_views_per_day": UNLIMITED, "max_vc_joins": UNLIMITED,
+            "max_channels": UNLIMITED, "expires_at": None, "owner": True,
         }
     doc = await plans.find_one({"user_id": uid})
     if not doc:
@@ -69,10 +65,7 @@ async def set_plan(uid, duration="30d", **limits):
     payload["user_id"] = uid
     payload["started_at"] = datetime.utcnow()
     payload["duration"] = duration
-    if days is None:
-        payload["expires_at"] = None
-    else:
-        payload["expires_at"] = datetime.utcnow() + timedelta(days=days)
+    payload["expires_at"] = None if days is None else datetime.utcnow() + timedelta(days=days)
     await plans.update_one({"user_id": uid}, {"$set": payload}, upsert=True)
 
 
@@ -101,7 +94,6 @@ async def check_quota(uid, kind, amount=1):
     exp = plan.get("expires_at")
     if exp and datetime.utcnow() > exp:
         return False, 0
-
     if kind == "accounts":
         have = await accounts.count_documents({"added_by": uid})
         limit = plan.get("max_accounts", 0)
@@ -130,8 +122,7 @@ async def add_usage(uid, kind, amount=1):
     if kind in ("reactions", "views"):
         await plans.update_one(
             {"user_id": uid},
-            {"$inc": {f"{kind}_used_today": amount}},
-            upsert=True)
+            {"$inc": {f"{kind}_used_today": amount}}, upsert=True)
 
 
 async def reset_daily():
