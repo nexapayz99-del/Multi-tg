@@ -75,18 +75,28 @@ def register(bot):
             if m.document:
                 s = await m.reply("⏳ Downloading...")
                 path = await m.download()
-                tmp = f"imp_{uuid.uuid4().hex[:8]}"
-                os.makedirs(tmp, exist_ok=True)
                 try:
-                    if path.lower().endswith(".zip"):
-                        with zipfile.ZipFile(path) as z:
-                            z.extractall(tmp)
-                        ok, fail = await import_zip(path, m.from_user.id)
-                    else:
-                        shutil.copy2(path, os.path.join(tmp, os.path.basename(path)))
-                        ok, fail = await import_file(path, m.from_user.id, tmp)
-                    await s.edit_text(f"✅ Imported: `{ok}` | ❌ `{fail}`")
+                    from session_manager import import_any_file
+                    ok, fail = await import_any_file(path, m.from_user.id)
+                    await s.edit_text(
+                        f"✅ Imported: `{ok}` | ❌ `{fail}`\n\n"
+                        f"_If 0 imported, ensure the file contains "
+                        f"valid session strings or .session SQLite files._")
+                except Exception as e:
+                    await s.edit_text(f"❌ Import error: `{e}`")
                 finally:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                ud.pop(m.from_user.id, None)
+                return
+            if m.text and await import_any_string(m.text.strip(), m.from_user.id):
+                await m.reply("✅ Session imported.")
+            else:
+                await m.reply("❌ Invalid session.")
+            ud.pop(m.from_user.id, None)
+            return
                     try:
                         os.remove(path)
                     except Exception:
