@@ -43,7 +43,7 @@ def register(bot):
         c.user_data[m.from_user.id] = {"step": "import_file"}
         await m.reply(
             "📦 **Send your file**\n\n"
-            "Supported formats:\n"
+            "Supported:\n"
             "• `.zip` with any mix of files\n"
             "• `.session` (Telethon SQLite)\n"
             "• `.json` (Telethon / Pyrogram / custom)\n"
@@ -81,9 +81,7 @@ def register(bot):
             return
         step = st.get("step") if isinstance(st, dict) else None
 
-        # ═══════════════════════════════════════════════════
-        # FILE IMPORT — supports .zip, .session, .json, .txt, .hex
-        # ═══════════════════════════════════════════════════
+        # ═══ FILE IMPORT ═══
         if step == "import_file" and (m.document or m.text):
             if m.document:
                 s = await m.reply("⏳ Downloading and importing...")
@@ -94,7 +92,7 @@ def register(bot):
                         f"🏁 **Import Complete**\n\n"
                         f"✅ Imported: `{ok}`\n"
                         f"❌ Failed: `{fail}`\n\n"
-                        f"_Note: expired/dead sessions are counted as failed._")
+                        f"_Expired/dead sessions count as failed._")
                 except Exception as e:
                     logger.exception(f"import error: {e}")
                     await s.edit_text(f"❌ Import error: `{e}`")
@@ -106,7 +104,6 @@ def register(bot):
                 ud.pop(m.from_user.id, None)
                 return
 
-            # Text message — try raw session string
             if m.text:
                 if await import_any_string(m.text.strip(), m.from_user.id):
                     await m.reply("✅ Session imported.")
@@ -115,9 +112,7 @@ def register(bot):
                 ud.pop(m.from_user.id, None)
                 return
 
-        # ═══════════════════════════════════════════════════
-        # RANDOMIZER
-        # ═══════════════════════════════════════════════════
+        # ═══ RANDOMIZER ═══
         if step == "randomizer_zip" and m.document:
             s = await m.reply("⏳ Applying...")
             path = await m.download()
@@ -137,9 +132,7 @@ def register(bot):
             ud.pop(m.from_user.id, None)
             return
 
-        # ═══════════════════════════════════════════════════
-        # LOGIN FLOW
-        # ═══════════════════════════════════════════════════
+        # ═══ LOGIN FLOW ═══
         if step == "phone" and m.text:
             try:
                 temp = Client(f"temp_{uuid.uuid4().hex[:6]}",
