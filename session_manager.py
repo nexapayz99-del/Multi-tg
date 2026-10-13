@@ -1,5 +1,5 @@
 """
-session_manager.py — bulletproof session importer
+session_manager.py — bulletproof session importer (with proxy support)
 
 Supported:
   • Pyrogram v2 strings (BQ..., Ag...)
@@ -15,6 +15,7 @@ import os, json, glob, sqlite3, struct, base64, zipfile, shutil, uuid, re, loggi
 from pyrogram import Client
 from config import API_ID, API_HASH
 from database import save_account
+from utils.proxy import get_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,7 @@ async def import_any_string(s: str, uid: int,
                 api_id=use_api_id, api_hash=use_api_hash,
                 session_string=pyro_str,
                 in_memory=True, no_updates=True,
+                proxy=get_proxy(),
             ) as app:
                 me = await app.get_me()
                 ss = await app.export_session_string()
@@ -180,6 +182,7 @@ async def import_any_string(s: str, uid: int,
                 api_id=use_api_id, api_hash=use_api_hash,
                 session_string=s,
                 in_memory=True, no_updates=True,
+                proxy=get_proxy(),
             ) as app:
                 me = await app.get_me()
                 ss = await app.export_session_string()
@@ -199,6 +202,7 @@ async def import_any_string(s: str, uid: int,
                 api_id=use_api_id, api_hash=use_api_hash,
                 session_string=s,
                 in_memory=True, no_updates=True,
+                proxy=get_proxy(),
             ) as app:
                 me = await app.get_me()
                 ss = await app.export_session_string()
@@ -300,6 +304,7 @@ async def import_file(path: str, uid: int, extract_dir: str) -> tuple:
                 api_id=used_api_id, api_hash=API_HASH,
                 session_string=ss,
                 in_memory=True, no_updates=True,
+                proxy=get_proxy(),
             ) as app:
                 me = await app.get_me()
                 ss2 = await app.export_session_string()
