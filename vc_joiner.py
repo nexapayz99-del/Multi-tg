@@ -1,15 +1,7 @@
-"""
-vc_joiner.py — resource-safe VC joiner
-  • Batched joins (10 at a time, 5s delay between batches)
-  • Persistent probe client
-  • Unmuted mic (plays silent.wav)
-  • Drops dead sessions
-"""
+"""vc_joiner.py — resource-safe VC joiner with proxy support"""
 import asyncio, uuid, os, wave, logging
 
-# ═══════════════════════════════════════════════════════════════════
-# Pyrogram compatibility patches — must run before pytgcalls import
-# ═══════════════════════════════════════════════════════════════════
+# ═══ Pyrogram patches ═══
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
 from pyrogram.raw.core import TLObject
@@ -64,15 +56,16 @@ _MISSING_RAW = {
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
         setattr(_phone_module, _name, type(_name, (_StubTLObject,), {"ID": _id}))
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════
 
 from pyrogram import Client
 from pyrogram.raw import functions
 from config import API_ID, API_HASH, SILENT_WAV
 from database import all_accounts
+from utils.proxy import get_proxy, proxy_count
 
 logger = logging.getLogger(__name__)
-logger.info("🔧 Pyrogram GroupCall patches applied")
+logger.info(f"🔧 Pyrogram GroupCall patches applied | proxies: {proxy_count()}")
 
 PyTgCalls = None
 MediaStream = None
@@ -89,11 +82,9 @@ except Exception as e:
 _active_sessions = {}
 _stop_events = {}
 
-# ⭐ Batching — prevents flood waits and FD exhaustion
-VC_JOIN_DELAY = 2          # seconds between accounts inside a batch
-VC_BATCH_SIZE = 10         # accounts per batch
-VC_BATCH_PAUSE = 5         # seconds pause between batches
-VC_MAX_PARALLEL = 3        # how many accounts in one batch join simultaneously
+# ⭐ Batching — softens flood limits
+VC_BATCH_SIZE = 5
+VC_BATCH_PAUSE = 6
 
 DEAD_MARKERS = (
     "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
@@ -165,11 +156,15 @@ async def _play_unmuted(call_py, chat_id, media_path):
 async def _join_one(phone, session, chat_target):
     app = None
     try:
+        # ⭐ Each account uses the SAME proxy every time (seed = phone)
+        proxy = get_proxy(seed=phone)
+
         app = Client(
             f"vcj_{uuid.uuid4().hex[:6]}",
             api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             in_memory=True, no_updates=True,
+            proxy=proxy,
         )
         await app.start()
 
@@ -237,9 +232,8 @@ async def leave_all():
         await leave_one(ph)
 
 
-# ⭐ BATCHED JOIN — replaces the old parallel gather
 async def _join_batch(accs, chat_target, stop_event):
-    """Join accounts in small batches to avoid flood-waits and FD exhaustion."""
+    """Join accounts in small batches."""
     joined = failed = 0
 
     for i in range(0, len(accs), VC_BATCH_SIZE):
@@ -265,7 +259,6 @@ async def _join_batch(accs, chat_target, stop_event):
                         f"✅ {joined} | ❌ {failed} "
                         f"({min(i+VC_BATCH_SIZE, len(accs))}/{len(accs)})")
 
-        # Pause between batches
         if i + VC_BATCH_SIZE < len(accs):
             await asyncio.sleep(VC_BATCH_PAUSE)
 
@@ -290,15 +283,16 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                 await asyncio.sleep(30)
                 continue
 
-            # Probe VC — uses a fresh short-lived client per probe
             probe = accs[0]
             live = False
             try:
+                proxy = get_proxy(seed=probe["phone"])
                 async with Client(
                     f"probe_{uuid.uuid4().hex[:6]}",
                     api_id=API_ID, api_hash=API_HASH,
                     session_string=probe["session"],
                     in_memory=True, no_updates=True,
+                    proxy=proxy,
                 ) as pc:
                     chat = await pc.get_chat(chat_target)
                     live = await is_vc_live(pc, chat.id)
