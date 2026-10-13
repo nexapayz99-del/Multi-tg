@@ -10,7 +10,7 @@ def _get(key, default=None, required=False):
     v = os.getenv(key, default)
     if v is None or v == "":
         if required:
-            raise RuntimeError(f"Missing required env: {key} (check {ENV_PATH})")
+            raise RuntimeError(f"Missing required env: {key}")
         return default
     return v.strip()
 
@@ -30,12 +30,12 @@ VC_POLL_INTERVAL = 15
 SILENT_WAV = "silent.wav"
 POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "😁", "🎉", "🤩", "🙏", "💯", "😍", "👌"]
 
-# ═══════════════════════════════════════════════════════
-# FSub permanently disabled
-# ═══════════════════════════════════════════════════════
 USE_FSUB = False
 FSUB_CHANNEL_ID = 0
 FSUB_CHANNEL_LINK = ""
+
+# ⭐ Proxy list — comma-separated SOCKS5 URLs
+PROXY_LIST = [p.strip() for p in _get("PROXY_LIST", "").split(",") if p.strip()]
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError(f"BOT_TOKEN missing/invalid: {BOT_TOKEN!r}")
