@@ -19,6 +19,7 @@ sessions_seen  = db["sessions_seen"]
 settings       = db["settings"]
 banned_users   = db["banned_users"]
 
+# Fernet for session encryption
 _fernet = Fernet(SESSION_KEY) if SESSION_KEY else None
 
 
@@ -45,6 +46,7 @@ async def get_account(phone: str):
 
 
 async def save_account(phone, session, name, uid, extra=None):
+    """Save session to MongoDB only — never to disk."""
     payload = {
         "phone": phone,
         "session": encrypt_session(session),
@@ -54,9 +56,11 @@ async def save_account(phone, session, name, uid, extra=None):
     if extra:
         payload.update(extra)
     await accounts.update_one({"phone": phone}, {"$set": payload}, upsert=True)
+    logger.info(f"💾 Session saved to MongoDB: {phone} ({name})")
 
 
 async def all_accounts(limit=5000):
+    """Return all sessions from MongoDB."""
     docs = await accounts.find({}).to_list(length=limit)
     for d in docs:
         if d.get("session"):
