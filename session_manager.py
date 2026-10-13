@@ -1,17 +1,15 @@
 """
-session_manager.py — complete working session importer
+session_manager.py — bulletproof session importer
 
-Supported formats:
-  • Pyrogram v2 strings           (start with "BQ")
-  • Telethon strings              (start with "1")
-  • DC:HEX format                 ("5:68610c3f...")
+Supported:
+  • Pyrogram v2 strings (BQ..., Ag...)
+  • Telethon strings (1...)
+  • DC:HEX format (5:68610c3f...)
   • Plain hex 512 chars
-  • JSON files (pyrogram_string, telethon_string, hex_auth_key, session_string)
-  • SQLite .session (Telethon AND Pyrogram schemas)
-  • TXT files (one string per line)
-  • ZIP archives (with nested zips)
-
-Uses api_id / api_hash from the JSON when available, otherwise config defaults.
+  • JSON files (pyrogram_string / telethon_string / hex_auth_key)
+  • SQLite .session (Pyrogram AND Telethon schemas)
+  • TXT files
+  • ZIP archives
 """
 import os, json, glob, sqlite3, struct, base64, zipfile, shutil, uuid, re, logging
 from pyrogram import Client
@@ -25,12 +23,13 @@ logger = logging.getLogger(__name__)
 # VALIDATORS
 # ═══════════════════════════════════════════════════════════════
 def is_valid_pyrogram_string(s: str) -> bool:
+    """Accept BQ... AND Ag... pyrogram strings."""
     if not s or not isinstance(s, str):
         return False
     s = s.strip()
-    if not s.startswith("BQ"):
+    if not (s.startswith("BQ") or s.startswith("Ag")):
         return False
-    if not (300 <= len(s) <= 5000):
+    if not (200 <= len(s) <= 5000):
         return False
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=")
     if not all(c in allowed for c in s):
@@ -38,8 +37,8 @@ def is_valid_pyrogram_string(s: str) -> bool:
     try:
         pad = (-len(s)) % 4
         raw = base64.urlsafe_b64decode(s + "=" * pad)
-        # Pyrogram v2: 271 bytes expected
-        return 260 <= len(raw) <= 280
+        # Pyrogram v2: 271 bytes (or close)
+        return 200 <= len(raw) <= 500
     except Exception:
         return False
 
@@ -61,7 +60,7 @@ def is_valid_telethon_string(s: str) -> bool:
 
 
 def _parse_dc_hex(s: str):
-    """Parse 'DC:HEX' or plain 512-char hex → (dc_id, key_bytes)."""
+    """Parse DC:HEX → (dc_id, key_bytes)."""
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
@@ -88,17 +87,13 @@ def _parse_dc_hex(s: str):
 
 
 def hex_to_pyrogram_string(dc_id: int, key_bytes: bytes, api_id: int = None):
-    """Pack DC + 256-byte auth key → Pyrogram v2 session string."""
     api_id = api_id or API_ID
     packed = struct.pack(">BI?256sq?", dc_id, api_id, False, key_bytes, 0, False)
     return base64.urlsafe_b64encode(packed).decode().rstrip("=")
 
 
 def extract_from_sqlite(db_path, api_id=None):
-    """
-    Extract pyrogram string from a Pyrogram OR Telethon .session SQLite file.
-    Returns (session_string, used_api_id) or (None, None).
-    """
+    """Return (session_string, api_id) or (None, None)."""
     api_id = api_id or API_ID
     try:
         with sqlite3.connect(db_path) as conn:
@@ -107,7 +102,6 @@ def extract_from_sqlite(db_path, api_id=None):
             cols = [r[1] for r in c.fetchall()]
 
             if "auth_key" not in cols or "dc_id" not in cols:
-                logger.debug(f"  sqlite: missing auth_key/dc_id (have {cols})")
                 return None, None
 
             c.execute("SELECT dc_id, auth_key FROM sessions LIMIT 1")
@@ -117,10 +111,8 @@ def extract_from_sqlite(db_path, api_id=None):
 
             dc_id, auth_key = row
             if not auth_key or len(auth_key) != 256:
-                logger.debug(f"  sqlite: bad key len {len(auth_key) if auth_key else 0}")
                 return None, None
 
-            # Get api_id from file if present (Pyrogram format)
             stored_api_id = api_id
             if "api_id" in cols:
                 c.execute("SELECT api_id FROM sessions LIMIT 1")
@@ -138,15 +130,12 @@ def extract_from_sqlite(db_path, api_id=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SINGLE STRING IMPORT
+# CORE IMPORT
 # ═══════════════════════════════════════════════════════════════
 async def import_any_string(s: str, uid: int,
                             api_id_hint: int = None,
-                            api_hash_hint: str = None) -> bool:
-    """
-    Try every known string format.
-    Uses api_id_hint / api_hash_hint if provided.
-    """
+                            api_hash_hint: str = None,
+                            label: str = "") -> bool:
     if not s or not isinstance(s, str):
         return False
     s = s.strip()
@@ -163,7 +152,7 @@ async def import_any_string(s: str, uid: int,
         try:
             pyro_str = hex_to_pyrogram_string(dc_id, key_bytes, use_api_id)
         except Exception as e:
-            logger.debug(f"  hex→string failed: {e}")
+            logger.warning(f"  ❌ hex→string fail: {e}")
             return False
 
         try:
@@ -180,10 +169,10 @@ async def import_any_string(s: str, uid: int,
                 logger.info(f"  ✅ HEX OK: {me.first_name} ({me.phone_number})")
                 return True
         except Exception as e:
-            logger.warning(f"  ❌ hex login failed: {str(e)[:140]}")
+            logger.warning(f"  ❌ hex login failed: {str(e)[:120]}")
             return False
 
-    # ─── 2. Pyrogram string ───
+    # ─── 2. Pyrogram string (BQ... / Ag...) ───
     if is_valid_pyrogram_string(s):
         try:
             async with Client(
@@ -199,7 +188,7 @@ async def import_any_string(s: str, uid: int,
                 logger.info(f"  ✅ PYROGRAM OK: {me.first_name} ({me.phone_number})")
                 return True
         except Exception as e:
-            logger.warning(f"  ❌ pyrogram failed: {str(e)[:140]}")
+            logger.warning(f"  ❌ pyrogram failed: {str(e)[:120]}")
             return False
 
     # ─── 3. Telethon string ───
@@ -218,7 +207,7 @@ async def import_any_string(s: str, uid: int,
                 logger.info(f"  ✅ TELETHON OK: {me.first_name} ({me.phone_number})")
                 return True
         except Exception as e:
-            logger.warning(f"  ❌ telethon failed: {str(e)[:140]}")
+            logger.warning(f"  ❌ telethon failed: {str(e)[:120]}")
             return False
 
     logger.debug(f"  not recognized (len={len(s)}, prefix={s[:20]!r})")
@@ -226,7 +215,7 @@ async def import_any_string(s: str, uid: int,
 
 
 # ═══════════════════════════════════════════════════════════════
-# JSON IMPORT — handles all your key names
+# JSON IMPORT
 # ═══════════════════════════════════════════════════════════════
 async def import_json_file(jf: str, uid: int) -> bool:
     logger.info(f"📄 JSON: {os.path.basename(jf)}")
@@ -240,7 +229,6 @@ async def import_json_file(jf: str, uid: int) -> bool:
     if not isinstance(data, dict):
         return False
 
-    # Use api_id/api_hash from JSON if present
     json_api_id = data.get("api_id") or data.get("app_id")
     json_api_hash = data.get("api_hash") or data.get("app_hash")
     if json_api_id:
@@ -249,32 +237,31 @@ async def import_json_file(jf: str, uid: int) -> bool:
         except Exception:
             json_api_id = None
 
-    # Try in priority order
-    candidates = []
+    # Priority order
+    tried_any = False
     for key in ("pyrogram_string", "session_string", "session",
                 "string_session", "StringSession",
                 "hex_auth_key", "telethon_string"):
         v = data.get(key)
-        if v and isinstance(v, str) and v not in ("null", "None"):
-            candidates.append((key, v))
-
-    if not candidates:
-        logger.warning(f"   ❌ no session key. Keys: {list(data.keys())}")
-        return False
-
-    for name, val in candidates:
-        logger.info(f"   trying {name} (len={len(val)})")
-        if await import_any_string(val, uid,
+        if not v or not isinstance(v, str) or v in ("null", "None"):
+            continue
+        tried_any = True
+        logger.info(f"   trying {key} (len={len(v)})")
+        if await import_any_string(v, uid,
                                    api_id_hint=json_api_id,
-                                   api_hash_hint=json_api_hash):
+                                   api_hash_hint=json_api_hash,
+                                   label=key):
             return True
 
-    logger.warning(f"   ❌ all keys failed in {os.path.basename(jf)}")
+    if not tried_any:
+        logger.warning(f"   ❌ no session key. Keys: {list(data.keys())}")
+    else:
+        logger.warning(f"   ❌ all keys failed in {os.path.basename(jf)}")
     return False
 
 
 # ═══════════════════════════════════════════════════════════════
-# FILE IMPORT — walk a directory
+# FILE IMPORT
 # ═══════════════════════════════════════════════════════════════
 async def import_file(path: str, uid: int, extract_dir: str) -> tuple:
     ok = fail = 0
@@ -334,9 +321,9 @@ async def import_file(path: str, uid: int, extract_dir: str) -> tuple:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    # Only accept plausible session lines
                     if not (re.match(r"^\d{1,2}:[0-9a-fA-F]", line) or
                             line.startswith("BQ") or
+                            line.startswith("Ag") or
                             line.startswith("1") or
                             len(line) == 512):
                         continue
@@ -348,50 +335,29 @@ async def import_file(path: str, uid: int, extract_dir: str) -> tuple:
         except Exception as e:
             logger.warning(f"   ❌ read fail: {e}")
 
-    # ─── .hex ───
-    for hf in glob.glob(f"{extract_dir}/**/*.hex", recursive=True):
-        base = os.path.basename(hf)
-        logger.info(f"🔑 HEX: {base}")
-        try:
-            with open(hf, "r", encoding="utf-8") as f:
-                for ln, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if await import_any_string(line, uid):
-                        ok += 1
-                    else:
-                        fail += 1
-        except Exception as e:
-            logger.warning(f"   ❌ read fail: {e}")
-
     logger.info(f"🏁 Import: ✅ {ok} | ❌ {fail}")
     return ok, fail
 
 
 # ═══════════════════════════════════════════════════════════════
-# ZIP IMPORT
+# ZIP / FILE ENTRY
 # ═══════════════════════════════════════════════════════════════
 async def import_zip(zip_path: str, uid: int) -> tuple:
     tmp = f"tmp_{uuid.uuid4().hex[:8]}"
     os.makedirs(tmp, exist_ok=True)
     try:
         with zipfile.ZipFile(zip_path) as z:
-            names = z.namelist()
-            logger.info(f"🗜️  ZIP: {len(names)} entries")
-            for n in names[:15]:
-                logger.info(f"   - {n}")
+            logger.info(f"🗜️  ZIP: {len(z.namelist())} entries")
             z.extractall(tmp)
 
-        # Extract nested zips
         for inner_zip in glob.glob(f"{tmp}/**/*.zip", recursive=True):
             inner_dir = os.path.splitext(inner_zip)[0]
             os.makedirs(inner_dir, exist_ok=True)
             try:
                 with zipfile.ZipFile(inner_zip) as z:
                     z.extractall(inner_dir)
-            except Exception as e:
-                logger.debug(f"inner zip: {e}")
+            except Exception:
+                pass
 
         return await import_file(zip_path, uid, tmp)
     finally:
@@ -399,8 +365,7 @@ async def import_zip(zip_path: str, uid: int) -> tuple:
 
 
 async def import_any_file(path: str, uid: int) -> tuple:
-    low = path.lower()
-    if low.endswith(".zip"):
+    if path.lower().endswith(".zip"):
         return await import_zip(path, uid)
 
     tmp = f"tmp_{uuid.uuid4().hex[:8]}"
