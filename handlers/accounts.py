@@ -1,12 +1,10 @@
-import os, uuid, shutil, zipfile, logging, base64
+import os, uuid, logging, base64
 from pyrogram import filters, Client
 from pyrogram.errors import SessionPasswordNeeded
 from config import API_ID, API_HASH, OWNER_ID
 from database import all_accounts, save_account
 from quota import check_quota, has_active_plan, is_banned
-from session_manager import (
-    import_any_string, import_any_file, import_file, import_zip,
-)
+from session_manager import import_any_string, import_any_file
 from indian_randomizer import apply_randomizer
 
 logger = logging.getLogger(__name__)
@@ -15,7 +13,7 @@ logger = logging.getLogger(__name__)
 async def _addacc_impl(c, m):
     uid = m.from_user.id
     if await is_banned(uid):
-        return await m.reply("🔨 **You are banned.** Contact the owner.")
+        return await m.reply("🔨 **You are banned.**")
     if not await has_active_plan(uid):
         return await m.reply(
             f"🚫 **No active plan.**\n\nContact the owner.\n🆔 `{uid}`")
@@ -43,11 +41,11 @@ def register(bot):
         c.user_data[m.from_user.id] = {"step": "import_file"}
         await m.reply(
             "📦 **Send your file**\n\n"
-            "Supported formats:\n"
-            "• `.zip` (with any mix of files)\n"
-            "• `.session` (Telethon SQLite)\n"
-            "• `.json` (Telethon / Pyrogram / custom)\n"
-            "• `.txt` (one session string per line)\n"
+            "Supported:\n"
+            "• `.zip` (any mix)\n"
+            "• `.session` (SQLite)\n"
+            "• `.json` (Telethon/Pyrogram)\n"
+            "• `.txt` (one session per line)\n"
             "• `.hex` (raw auth key)\n"
             "• Or paste a session string directly")
 
@@ -61,18 +59,6 @@ def register(bot):
         c.user_data[m.from_user.id] = {"step": "randomizer_zip"}
         await m.reply("📦 Send ZIP with names.txt + photos or pairs.json.")
 
-    @bot.on_message(filters.command("accounts"))
-    async def _list(c, m):
-        accs = await all_accounts()
-        mine = [a for a in accs
-                if a.get("added_by") == m.from_user.id or m.from_user.id == OWNER_ID]
-        if not mine:
-            return await m.reply("No accounts.")
-        txt = f"📱 **Accounts** ({len(mine)})\n\n"
-        for a in mine[:50]:
-            txt += f"• `{a.get('phone')}` — {a.get('name','?')}\n"
-        await m.reply(txt)
-
     @bot.on_message(filters.private, group=-2)
     async def _states(c, m):
         ud = getattr(c, "user_data", {})
@@ -81,21 +67,16 @@ def register(bot):
             return
         step = st.get("step") if isinstance(st, dict) else None
 
-        # ═══ FILE IMPORT ═══
         if step == "import_file" and (m.document or m.text):
             if m.document:
-                s = await m.reply(
-                    "⏳ **Downloading and importing...**\n\n"
-                    "_Check the VPS log for details._")
+                s = await m.reply("⏳ Downloading and importing...")
                 path = await m.download()
                 try:
                     ok, fail = await import_any_file(path, m.from_user.id)
                     await s.edit_text(
                         f"🏁 **Import Complete**\n\n"
                         f"✅ Imported: `{ok}`\n"
-                        f"❌ Failed: `{fail}`\n\n"
-                        f"_Expired/dead sessions count as failed._\n"
-                        f"_Check VPS logs for per-file details._")
+                        f"❌ Failed: `{fail}`")
                 except Exception as e:
                     logger.exception(f"import error: {e}")
                     await s.edit_text(f"❌ Import error: `{e}`")
@@ -115,7 +96,6 @@ def register(bot):
                 ud.pop(m.from_user.id, None)
                 return
 
-        # ═══ RANDOMIZER ═══
         if step == "randomizer_zip" and m.document:
             s = await m.reply("⏳ Applying...")
             path = await m.download()
@@ -135,7 +115,6 @@ def register(bot):
             ud.pop(m.from_user.id, None)
             return
 
-        # ═══ LOGIN FLOW ═══
         if step == "phone" and m.text:
             try:
                 temp = Client(f"temp_{uuid.uuid4().hex[:6]}",
@@ -144,10 +123,8 @@ def register(bot):
                 await temp.connect()
                 co = await temp.send_code(m.text.strip())
                 ud[m.from_user.id] = {
-                    "step": "code",
-                    "phone": m.text.strip(),
-                    "hash": co.phone_code_hash,
-                    "client": temp,
+                    "step": "code", "phone": m.text.strip(),
+                    "hash": co.phone_code_hash, "client": temp,
                 }
                 await m.reply("📩 Enter OTP:")
             except Exception as e:
