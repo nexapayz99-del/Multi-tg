@@ -16,6 +16,15 @@ import handlers.plans, handlers.broadcast
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+# Silence Pyrogram's session spam — keeps our import logs visible
+for _noisy in (
+    "pyrogram.session.session",
+    "pyrogram.connection.connection",
+    "pyrogram.session.auth",
+    "pyrogram.crypto.aes",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 bot = Client("multi_manager_bot",
