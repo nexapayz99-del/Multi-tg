@@ -1,4 +1,4 @@
-"""vc_joiner.py — resource-safe VC joiner with proxy support"""
+"""vc_joiner.py — fast parallel VC joins, unmuted mic"""
 import asyncio, uuid, os, wave, logging
 
 # ═══ Pyrogram patches ═══
@@ -6,10 +6,8 @@ import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
 from pyrogram.raw.core import TLObject
 
-
 class _DummyGroupCallError(_pg_errors.BadRequest):
     pass
-
 
 _MISSING_ERRORS = [
     "GroupcallForbidden", "GroupCallForbidden",
@@ -19,7 +17,8 @@ _MISSING_ERRORS = [
 ]
 for _err_name in _MISSING_ERRORS:
     if not hasattr(_pg_errors, _err_name):
-        setattr(_pg_errors, _err_name, type(_err_name, (_DummyGroupCallError,), {}))
+        setattr(_pg_errors, _err_name,
+                type(_err_name, (_DummyGroupCallError,), {}))
 
 try:
     import pyrogram.errors.exceptions.bad_request_400 as _b400
@@ -55,17 +54,16 @@ _MISSING_RAW = {
 }
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
-        setattr(_phone_module, _name, type(_name, (_StubTLObject,), {"ID": _id}))
-# ═══════════════════════
+        setattr(_phone_module, _name,
+                type(_name, (_StubTLObject,), {"ID": _id}))
 
 from pyrogram import Client
 from pyrogram.raw import functions
 from config import API_ID, API_HASH, SILENT_WAV
 from database import all_accounts
-from utils.proxy import get_proxy, proxy_count
 
 logger = logging.getLogger(__name__)
-logger.info(f"🔧 Pyrogram GroupCall patches applied | proxies: {proxy_count()}")
+logger.info("🔧 Pyrogram GroupCall patches applied")
 
 PyTgCalls = None
 MediaStream = None
@@ -78,13 +76,10 @@ try:
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
-
 _active_sessions = {}
 _stop_events = {}
-
-# ⭐ Batching — softens flood limits
-VC_BATCH_SIZE = 5
-VC_BATCH_PAUSE = 6
+VC_JOIN_DELAY = 1
+VC_JOIN_PARALLEL = 3
 
 DEAD_MARKERS = (
     "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
@@ -156,15 +151,11 @@ async def _play_unmuted(call_py, chat_id, media_path):
 async def _join_one(phone, session, chat_target):
     app = None
     try:
-        # ⭐ Each account uses the SAME proxy every time (seed = phone)
-        proxy = get_proxy(seed=phone)
-
         app = Client(
             f"vcj_{uuid.uuid4().hex[:6]}",
             api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             in_memory=True, no_updates=True,
-            proxy=proxy,
         )
         await app.start()
 
@@ -218,8 +209,7 @@ async def _join_one(phone, session, chat_target):
 
 async def leave_one(phone):
     blk = _active_sessions.pop(phone, None)
-    if not blk:
-        return
+    if not blk: return
     try: await blk["call"].leave_call(blk["chat_id"])
     except Exception: pass
     try: await blk["client"].stop()
@@ -233,41 +223,24 @@ async def leave_all():
 
 
 async def _join_batch(accs, chat_target, stop_event):
-    """Join accounts in small batches."""
     joined = failed = 0
-
-    for i in range(0, len(accs), VC_BATCH_SIZE):
+    for acc in accs:
         if stop_event.is_set():
             break
-
-        batch = accs[i:i + VC_BATCH_SIZE]
-        tasks = []
-        for acc in batch:
-            if acc["phone"] in _active_sessions:
-                joined += 1
-                continue
-            tasks.append(_join_one(acc["phone"], acc["session"], chat_target))
-
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if r:
-                    joined += 1
-                else:
-                    failed += 1
-            logger.info(f"🎤 batch {i//VC_BATCH_SIZE + 1}: "
-                        f"✅ {joined} | ❌ {failed} "
-                        f"({min(i+VC_BATCH_SIZE, len(accs))}/{len(accs)})")
-
-        if i + VC_BATCH_SIZE < len(accs):
-            await asyncio.sleep(VC_BATCH_PAUSE)
-
+        if acc["phone"] in _active_sessions:
+            joined += 1
+            continue
+        result = await _join_one(acc["phone"], acc["session"], chat_target)
+        if result:
+            joined += 1
+        else:
+            failed += 1
+        await asyncio.sleep(VC_JOIN_DELAY)
     return joined, failed
 
 
 async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
-    if not PYTGCALLS_OK:
-        return
+    if not PYTGCALLS_OK: return
     ensure_silent()
     _stop_events[key] = stop_event
     joined = False
@@ -286,13 +259,11 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
             probe = accs[0]
             live = False
             try:
-                proxy = get_proxy(seed=probe["phone"])
                 async with Client(
                     f"probe_{uuid.uuid4().hex[:6]}",
                     api_id=API_ID, api_hash=API_HASH,
                     session_string=probe["session"],
                     in_memory=True, no_updates=True,
-                    proxy=proxy,
                 ) as pc:
                     chat = await pc.get_chat(chat_target)
                     live = await is_vc_live(pc, chat.id)
@@ -304,25 +275,29 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                 logger.warning(f"probe failed: {err[:80]}")
 
             if live and not joined:
-                logger.info(
-                    f"🎤 VC LIVE — joining {len(accs)} accounts "
-                    f"(batches of {VC_BATCH_SIZE}, "
-                    f"{VC_BATCH_PAUSE}s pause)")
+                logger.info(f"🎤 VC LIVE — joining {len(accs)} accounts (parallel)")
+                groups = [[] for _ in range(VC_JOIN_PARALLEL)]
+                for i, a in enumerate(accs):
+                    groups[i % VC_JOIN_PARALLEL].append(a)
+
                 t0 = asyncio.get_event_loop().time()
-                ok, fail = await _join_batch(accs, chat_target, stop_event)
+                results = await asyncio.gather(
+                    *[_join_batch(g, chat_target, stop_event) for g in groups],
+                    return_exceptions=True,
+                )
+                total_joined = sum(r[0] for r in results if isinstance(r, tuple))
+                total_failed = sum(r[1] for r in results if isinstance(r, tuple))
                 elapsed = asyncio.get_event_loop().time() - t0
                 logger.info(
                     f"🎤 VC JOIN DONE in {elapsed:.1f}s — "
-                    f"✅ {ok} | ❌ {fail}")
+                    f"✅ {total_joined} | ❌ {total_failed}")
                 joined = True
             elif not live and joined:
                 logger.info(f"🎤 VC ended — leaving all")
                 await leave_all()
                 joined = False
-
         except Exception as e:
             logger.error(f"auto_vc_worker: {e}")
-
         await asyncio.sleep(15)
 
     await leave_all()
@@ -332,8 +307,7 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
 
 def stop_worker(key):
     ev = _stop_events.get(key)
-    if ev:
-        ev.set()
+    if ev: ev.set()
 
 
 def active_sessions():
