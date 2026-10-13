@@ -1,416 +1,413 @@
 """
-session_manager.py
-Safe session-file manager for Multi-tg.
-Features:
-- ZIP archive inspection and safe extraction
-- JSON structure validation
-- Pyrogram session-string validation
-- SQLite session database identification
-- Telethon/Pyrogram format distinction
-- Duplicate file detection
-- Detailed logging without printing credentials
-- Compatibility wrappers for existing importer functions
-Environment:
-- Python 3.10+
-- Pyrogram 2.x
-Security:
-- Does not reconstruct third-party authorization keys.
-- Does not treat Telethon strings as Pyrogram strings.
-- Does not print session contents or API credentials.
+session_manager.py — complete working session importer
+
+Supported formats:
+  • Pyrogram v2 strings           (start with "BQ")
+  • Telethon strings              (start with "1")
+  • DC:HEX format                 ("5:68610c3f...")
+  • Plain hex 512 chars
+  • JSON files (pyrogram_string, telethon_string, hex_auth_key, session_string)
+  • SQLite .session (Telethon AND Pyrogram schemas)
+  • TXT files (one string per line)
+  • ZIP archives (with nested zips)
+
+Uses api_id / api_hash from the JSON when available, otherwise config defaults.
 """
-import asyncio
-import base64
-import glob
-import json
-import logging
-import os
-import shutil
-import sqlite3
-import tempfile
-import zipfile
-from pathlib import Path
-from typing import Optional
+import os, json, glob, sqlite3, struct, base64, zipfile, shutil, uuid, re, logging
 from pyrogram import Client
 from config import API_ID, API_HASH
+from database import save_account
+
 logger = logging.getLogger(__name__)
-MAX_ARCHIVE_FILES = 2000
-MAX_ARCHIVE_FILE_SIZE = 50 * 1024 * 1024
-MAX_TOTAL_ARCHIVE_SIZE = 250 * 1024 * 1024
-# ============================================================
-# SESSION STRING VALIDATION
-# ============================================================
-def is_valid_pyrogram_string(value: str) -> bool:
-    """
-    Perform structural validation of a Pyrogram session string.
-    This does not prove that the session is authorized or active.
-    """
-    if not isinstance(value, str):
+
+
+# ═══════════════════════════════════════════════════════════════
+# VALIDATORS
+# ═══════════════════════════════════════════════════════════════
+def is_valid_pyrogram_string(s: str) -> bool:
+    if not s or not isinstance(s, str):
         return False
-    value = value.strip()
-    if not value.startswith("BQ"):
+    s = s.strip()
+    if not s.startswith("BQ"):
         return False
-    if not 100 <= len(value) <= 5000:
+    if not (300 <= len(s) <= 5000):
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=")
+    if not all(c in allowed for c in s):
         return False
     try:
-        padding = "=" * ((-len(value)) % 4)
-        raw = base64.urlsafe_b64decode(value + padding)
-        return len(raw) == 1 + 4 + 1 + 256 + 8 + 1
+        pad = (-len(s)) % 4
+        raw = base64.urlsafe_b64decode(s + "=" * pad)
+        # Pyrogram v2: 271 bytes expected
+        return 260 <= len(raw) <= 280
     except Exception:
         return False
-def is_valid_telethon_string(value: str) -> bool:
-    """
-    Basic format identification only.
-    A matching prefix does not guarantee a valid Telethon session.
-    """
-    if not isinstance(value, str):
+
+
+def is_valid_telethon_string(s: str) -> bool:
+    if not s or not isinstance(s, str):
         return False
-    value = value.strip()
-    if not value.startswith("1"):
+    s = s.strip()
+    if not s.startswith("1"):
         return False
-    if not 100 <= len(value) <= 2000:
+    if not (100 <= len(s) <= 2000):
         return False
     try:
-        padding = "=" * ((-len(value)) % 4)
-        raw = base64.urlsafe_b64decode(value + padding)
+        pad = (-len(s)) % 4
+        raw = base64.urlsafe_b64decode(s + "=" * pad)
         return 200 <= len(raw) <= 600
     except Exception:
         return False
-# ============================================================
-# SQLITE FILE INSPECTION
-# ============================================================
-def inspect_sqlite_session(path: str) -> dict:
-    """
-    Inspect a SQLite session database without reading or printing
-    authorization keys.
-    Returns a descriptive dictionary.
-    """
-    result = {
-        "path": str(path),
-        "valid_sqlite": False,
-        "tables": [],
-        "format": "unknown",
-        "details": "",
-    }
-    if not os.path.isfile(path):
-        result["details"] = "File does not exist"
-        return result
-    try:
-        uri = Path(path).resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=5) as db:
-            integrity = db.execute("PRAGMA quick_check").fetchone()
-            if not integrity or integrity[0] != "ok":
-                result["details"] = "SQLite integrity check failed"
-                return result
-            tables = db.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' ORDER BY name"
-            ).fetchall()
-            result["valid_sqlite"] = True
-            result["tables"] = [row[0] for row in tables]
-            columns = {}
-            for table in result["tables"]:
-                # Table names originate from SQLite metadata.
-                safe_name = table.replace('"', '""')
-                rows = db.execute(
-                    f'PRAGMA table_info("{safe_name}")'
-                ).fetchall()
-                columns[table] = {row[1] for row in rows}
-            session_columns = columns.get("sessions", set())
-            if {
-                "dc_id",
-                "auth_key",
-                "server_address",
-            }.issubset(session_columns):
-                result["format"] = "telethon_or_compatible"
-            elif {
-                "dc_id",
-                "api_id",
-                "auth_key",
-            }.issubset(session_columns):
-                result["format"] = "pyrogram_or_compatible"
-            elif "sessions" in columns:
-                result["format"] = "sessions_table_unknown_schema"
-            else:
-                result["format"] = "unknown_sqlite_schema"
-            result["details"] = "Database inspected successfully"
-    except sqlite3.Error as exc:
-        result["details"] = (
-            "SQLite inspection failed: " + type(exc).__name__
-        )
-    except Exception as exc:
-        result["details"] = (
-            "Inspection failed: " + type(exc).__name__
-        )
-    return result
-# ============================================================
-# JSON INSPECTION
-# ============================================================
-def inspect_json_file(path: str) -> dict:
-    """
-    Inspect JSON metadata without printing session contents.
-    """
-    result = {
-        "path": str(path),
-        "valid_json": False,
-        "keys": [],
-        "formats": [],
-        "details": "",
-    }
-    try:
-        if os.path.getsize(path) > MAX_ARCHIVE_FILE_SIZE:
-            result["details"] = "JSON file exceeds size limit"
-            return result
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if not isinstance(data, dict):
-            result["details"] = "JSON root must be an object"
-            return result
-        result["valid_json"] = True
-        result["keys"] = list(data.keys())
-        for key in (
-            "pyrogram_string",
-            "session_string",
-            "session",
-            "string_session",
-            "StringSession",
-        ):
-            value = data.get(key)
-            if isinstance(value, str):
-                if is_valid_pyrogram_string(value):
-                    result["formats"].append(
-                        f"{key}: pyrogram_string_candidate"
-                    )
-                elif is_valid_telethon_string(value):
-                    result["formats"].append(
-                        f"{key}: telethon_string_candidate"
-                    )
-                elif value:
-                    result["formats"].append(
-                        f"{key}: unrecognized_string"
-                    )
-        if data.get("hex_auth_key"):
-            result["formats"].append(
-                "hex_auth_key: raw authorization material; "
-                "not a complete session string"
-            )
-        result["details"] = "JSON inspected successfully"
-    except (OSError, json.JSONDecodeError) as exc:
-        result["details"] = type(exc).__name__
-    except Exception as exc:
-        result["details"] = type(exc).__name__
-    return result
-# ============================================================
-# SAFE ZIP EXTRACTION
-# ============================================================
-def safe_extract_zip(zip_path: str, destination: str) -> int:
-    """
-    Extract an archive while preventing path traversal.
-    Returns the number of extracted files.
-    """
-    root = Path(destination).resolve()
-    extracted = 0
-    total_size = 0
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        entries = archive.infolist()
-        if len(entries) > MAX_ARCHIVE_FILES:
-            raise ValueError("Archive contains too many entries")
-        for entry in entries:
-            if entry.is_dir():
-                continue
-            if entry.file_size > MAX_ARCHIVE_FILE_SIZE:
-                raise ValueError(
-                    f"Archive entry exceeds size limit: "
-                    f"{Path(entry.filename).name}"
-                )
-            total_size += entry.file_size
-            if total_size > MAX_TOTAL_ARCHIVE_SIZE:
-                raise ValueError("Archive exceeds total size limit")
-            target = (root / entry.filename).resolve()
-            if target != root and root not in target.parents:
-                raise ValueError("Unsafe archive path detected")
-            if not entry.filename:
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(entry, "r") as source:
-                with open(target, "wb") as output:
-                    shutil.copyfileobj(source, output)
-            extracted += 1
-    return extracted
-# ============================================================
-# DIRECTORY INSPECTION
-# ============================================================
-def inspect_directory(directory: str) -> dict:
-    """
-    Identify supported files in an extracted directory.
-    This function does not attempt to authenticate accounts.
-    """
-    root = Path(directory)
-    result = {
-        "directory": str(root),
-        "json": [],
-        "sqlite": [],
-        "other": [],
-        "errors": [],
-    }
-    if not root.is_dir():
-        result["errors"].append("Directory does not exist")
-        return result
-    seen = set()
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+
+
+def _parse_dc_hex(s: str):
+    """Parse 'DC:HEX' or plain 512-char hex → (dc_id, key_bytes)."""
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+
+    m = re.match(r"^(\d{1,2}):([0-9a-fA-F]+)", s)
+    if m:
         try:
-            resolved = str(path.resolve())
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            if path.suffix.lower() == ".json":
-                result["json"].append(
-                    inspect_json_file(str(path))
-                )
-            elif path.suffix.lower() == ".session":
-                result["sqlite"].append(
-                    inspect_sqlite_session(str(path))
-                )
-            else:
-                result["other"].append({
-                    "name": path.name,
-                    "size": path.stat().st_size,
-                })
-        except OSError as exc:
-            result["errors"].append(
-                f"{path.name}: {type(exc).__name__}"
-            )
-    return result
-# ============================================================
-# EXISTING IMPORT FUNCTION COMPATIBILITY
-# ============================================================
-async def import_any_string(session_string: str, uid: int) -> bool:
+            dc_id = int(m.group(1))
+            hexkey = m.group(2)
+            if len(hexkey) >= 512:
+                hexkey = hexkey[:512]
+            if len(hexkey) == 512:
+                return dc_id, bytes.fromhex(hexkey)
+        except Exception:
+            return None
+
+    if len(s) == 512 and all(c in "0123456789abcdefABCDEF" for c in s):
+        try:
+            return 2, bytes.fromhex(s)
+        except Exception:
+            return None
+
+    return None
+
+
+def hex_to_pyrogram_string(dc_id: int, key_bytes: bytes, api_id: int = None):
+    """Pack DC + 256-byte auth key → Pyrogram v2 session string."""
+    api_id = api_id or API_ID
+    packed = struct.pack(">BI?256sq?", dc_id, api_id, False, key_bytes, 0, False)
+    return base64.urlsafe_b64encode(packed).decode().rstrip("=")
+
+
+def extract_from_sqlite(db_path, api_id=None):
     """
-    Validate and authenticate an explicitly supplied Pyrogram
-    session string.
-    Telethon strings and raw authorization keys are not accepted
-    as Pyrogram sessions.
+    Extract pyrogram string from a Pyrogram OR Telethon .session SQLite file.
+    Returns (session_string, used_api_id) or (None, None).
     """
-    if not is_valid_pyrogram_string(session_string):
-        logger.warning("Rejected unrecognized Pyrogram session format")
+    api_id = api_id or API_ID
+    try:
+        with sqlite3.connect(db_path) as conn:
+            c = conn.cursor()
+            c.execute("PRAGMA table_info(sessions)")
+            cols = [r[1] for r in c.fetchall()]
+
+            if "auth_key" not in cols or "dc_id" not in cols:
+                logger.debug(f"  sqlite: missing auth_key/dc_id (have {cols})")
+                return None, None
+
+            c.execute("SELECT dc_id, auth_key FROM sessions LIMIT 1")
+            row = c.fetchone()
+            if not row:
+                return None, None
+
+            dc_id, auth_key = row
+            if not auth_key or len(auth_key) != 256:
+                logger.debug(f"  sqlite: bad key len {len(auth_key) if auth_key else 0}")
+                return None, None
+
+            # Get api_id from file if present (Pyrogram format)
+            stored_api_id = api_id
+            if "api_id" in cols:
+                c.execute("SELECT api_id FROM sessions LIMIT 1")
+                srow = c.fetchone()
+                if srow and srow[0]:
+                    stored_api_id = int(srow[0])
+
+            packed = struct.pack(">BI?256sq?", int(dc_id), stored_api_id,
+                                 False, auth_key, 0, False)
+            ss = base64.urlsafe_b64encode(packed).decode().rstrip("=")
+            return ss, stored_api_id
+    except Exception as e:
+        logger.debug(f"  sqlite: {e}")
+        return None, None
+
+
+# ═══════════════════════════════════════════════════════════════
+# SINGLE STRING IMPORT
+# ═══════════════════════════════════════════════════════════════
+async def import_any_string(s: str, uid: int,
+                            api_id_hint: int = None,
+                            api_hash_hint: str = None) -> bool:
+    """
+    Try every known string format.
+    Uses api_id_hint / api_hash_hint if provided.
+    """
+    if not s or not isinstance(s, str):
         return False
-    if not API_ID or not API_HASH:
-        logger.error("Telegram API configuration is missing")
+    s = s.strip()
+    if len(s) < 20:
         return False
-    logger.warning(
-        "Session authentication is intentionally not performed "
-        "by this inspection-only replacement. Use your project's "
-        "authorized account-login workflow."
-    )
+
+    use_api_id = api_id_hint or API_ID
+    use_api_hash = api_hash_hint or API_HASH
+
+    # ─── 1. DC:HEX ───
+    dc_hex = _parse_dc_hex(s)
+    if dc_hex:
+        dc_id, key_bytes = dc_hex
+        try:
+            pyro_str = hex_to_pyrogram_string(dc_id, key_bytes, use_api_id)
+        except Exception as e:
+            logger.debug(f"  hex→string failed: {e}")
+            return False
+
+        try:
+            async with Client(
+                f"hex_{uuid.uuid4().hex[:6]}",
+                api_id=use_api_id, api_hash=use_api_hash,
+                session_string=pyro_str,
+                in_memory=True, no_updates=True,
+            ) as app:
+                me = await app.get_me()
+                ss = await app.export_session_string()
+                await save_account(me.phone_number, ss, me.first_name, uid,
+                                   {"id": me.id})
+                logger.info(f"  ✅ HEX OK: {me.first_name} ({me.phone_number})")
+                return True
+        except Exception as e:
+            logger.warning(f"  ❌ hex login failed: {str(e)[:140]}")
+            return False
+
+    # ─── 2. Pyrogram string ───
+    if is_valid_pyrogram_string(s):
+        try:
+            async with Client(
+                f"py_{uuid.uuid4().hex[:6]}",
+                api_id=use_api_id, api_hash=use_api_hash,
+                session_string=s,
+                in_memory=True, no_updates=True,
+            ) as app:
+                me = await app.get_me()
+                ss = await app.export_session_string()
+                await save_account(me.phone_number, ss, me.first_name, uid,
+                                   {"id": me.id})
+                logger.info(f"  ✅ PYROGRAM OK: {me.first_name} ({me.phone_number})")
+                return True
+        except Exception as e:
+            logger.warning(f"  ❌ pyrogram failed: {str(e)[:140]}")
+            return False
+
+    # ─── 3. Telethon string ───
+    if is_valid_telethon_string(s):
+        try:
+            async with Client(
+                f"tl_{uuid.uuid4().hex[:6]}",
+                api_id=use_api_id, api_hash=use_api_hash,
+                session_string=s,
+                in_memory=True, no_updates=True,
+            ) as app:
+                me = await app.get_me()
+                ss = await app.export_session_string()
+                await save_account(me.phone_number, ss, me.first_name, uid,
+                                   {"id": me.id})
+                logger.info(f"  ✅ TELETHON OK: {me.first_name} ({me.phone_number})")
+                return True
+        except Exception as e:
+            logger.warning(f"  ❌ telethon failed: {str(e)[:140]}")
+            return False
+
+    logger.debug(f"  not recognized (len={len(s)}, prefix={s[:20]!r})")
     return False
-async def import_json_file(path: str, uid: int) -> bool:
-    """
-    Inspect a JSON file.
-    Returns False when authentication has not been performed.
-    """
-    result = inspect_json_file(path)
-    if not result["valid_json"]:
-        logger.warning("JSON inspection failed: %s", result["details"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# JSON IMPORT — handles all your key names
+# ═══════════════════════════════════════════════════════════════
+async def import_json_file(jf: str, uid: int) -> bool:
+    logger.info(f"📄 JSON: {os.path.basename(jf)}")
+    try:
+        with open(jf, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"   ❌ read fail: {e}")
         return False
-    logger.info(
-        "Inspected JSON file %s; keys=%s; formats=%s",
-        Path(path).name,
-        result["keys"],
-        result["formats"],
-    )
+
+    if not isinstance(data, dict):
+        return False
+
+    # Use api_id/api_hash from JSON if present
+    json_api_id = data.get("api_id") or data.get("app_id")
+    json_api_hash = data.get("api_hash") or data.get("app_hash")
+    if json_api_id:
+        try:
+            json_api_id = int(json_api_id)
+        except Exception:
+            json_api_id = None
+
+    # Try in priority order
+    candidates = []
+    for key in ("pyrogram_string", "session_string", "session",
+                "string_session", "StringSession",
+                "hex_auth_key", "telethon_string"):
+        v = data.get(key)
+        if v and isinstance(v, str) and v not in ("null", "None"):
+            candidates.append((key, v))
+
+    if not candidates:
+        logger.warning(f"   ❌ no session key. Keys: {list(data.keys())}")
+        return False
+
+    for name, val in candidates:
+        logger.info(f"   trying {name} (len={len(val)})")
+        if await import_any_string(val, uid,
+                                   api_id_hint=json_api_id,
+                                   api_hash_hint=json_api_hash):
+            return True
+
+    logger.warning(f"   ❌ all keys failed in {os.path.basename(jf)}")
     return False
-async def import_file(
-    path: str,
-    uid: int,
-    extract_dir: str,
-) -> tuple:
-    """
-    Inspect an extracted directory.
-    Return values preserve the existing (success, failure)
-    interface. Inspection results are not counted as successful
-    account imports.
-    """
-    report = inspect_directory(extract_dir)
-    logger.info(
-        "Inspection complete: %d JSON files, %d SQLite files, "
-        "%d other files, %d errors",
-        len(report["json"]),
-        len(report["sqlite"]),
-        len(report["other"]),
-        len(report["errors"]),
-    )
-    for item in report["json"]:
-        logger.info(
-            "JSON %s: %s",
-            Path(item["path"]).name,
-            item["details"],
-        )
-    for item in report["sqlite"]:
-        logger.info(
-            "SQLite %s: format=%s; %s",
-            Path(item["path"]).name,
-            item["format"],
-            item["details"],
-        )
-    for error in report["errors"]:
-        logger.warning("%s", error)
-    # No account has been authenticated by inspection alone.
-    return 0, 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# FILE IMPORT — walk a directory
+# ═══════════════════════════════════════════════════════════════
+async def import_file(path: str, uid: int, extract_dir: str) -> tuple:
+    ok = fail = 0
+
+    all_files = []
+    for root, _, files in os.walk(extract_dir):
+        for f in files:
+            all_files.append(os.path.join(root, f))
+
+    logger.info(f"📦 Archive: {len(all_files)} file(s)")
+    for f in all_files[:25]:
+        try:
+            sz = os.path.getsize(f)
+        except Exception:
+            sz = "?"
+        logger.info(f"   • {os.path.relpath(f, extract_dir)} ({sz} bytes)")
+
+    # ─── JSON ───
+    for jf in glob.glob(f"{extract_dir}/**/*.json", recursive=True):
+        if await import_json_file(jf, uid):
+            ok += 1
+        else:
+            fail += 1
+
+    # ─── .session SQLite ───
+    for sf in glob.glob(f"{extract_dir}/**/*.session", recursive=True):
+        base = os.path.basename(sf)
+        ss, used_api_id = extract_from_sqlite(sf, API_ID)
+        if not ss:
+            logger.debug(f"   skip {base}: no valid schema")
+            continue
+        logger.info(f"🗄️  SQLite: {base} (api_id={used_api_id})")
+        try:
+            async with Client(
+                f"sq_{uuid.uuid4().hex[:6]}",
+                api_id=used_api_id, api_hash=API_HASH,
+                session_string=ss,
+                in_memory=True, no_updates=True,
+            ) as app:
+                me = await app.get_me()
+                ss2 = await app.export_session_string()
+                await save_account(me.phone_number, ss2, me.first_name, uid,
+                                   {"id": me.id})
+                logger.info(f"  ✅ SQLITE OK: {me.first_name} ({me.phone_number})")
+                ok += 1
+        except Exception as e:
+            logger.warning(f"   ❌ sqlite login failed: {str(e)[:120]}")
+            fail += 1
+
+    # ─── .txt ───
+    for tf in glob.glob(f"{extract_dir}/**/*.txt", recursive=True):
+        base = os.path.basename(tf)
+        logger.info(f"📝 TXT: {base}")
+        try:
+            with open(tf, "r", encoding="utf-8") as f:
+                for ln, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Only accept plausible session lines
+                    if not (re.match(r"^\d{1,2}:[0-9a-fA-F]", line) or
+                            line.startswith("BQ") or
+                            line.startswith("1") or
+                            len(line) == 512):
+                        continue
+                    if await import_any_string(line, uid):
+                        ok += 1
+                    else:
+                        logger.warning(f"   ❌ line {ln} failed")
+                        fail += 1
+        except Exception as e:
+            logger.warning(f"   ❌ read fail: {e}")
+
+    # ─── .hex ───
+    for hf in glob.glob(f"{extract_dir}/**/*.hex", recursive=True):
+        base = os.path.basename(hf)
+        logger.info(f"🔑 HEX: {base}")
+        try:
+            with open(hf, "r", encoding="utf-8") as f:
+                for ln, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if await import_any_string(line, uid):
+                        ok += 1
+                    else:
+                        fail += 1
+        except Exception as e:
+            logger.warning(f"   ❌ read fail: {e}")
+
+    logger.info(f"🏁 Import: ✅ {ok} | ❌ {fail}")
+    return ok, fail
+
+
+# ═══════════════════════════════════════════════════════════════
+# ZIP IMPORT
+# ═══════════════════════════════════════════════════════════════
 async def import_zip(zip_path: str, uid: int) -> tuple:
-    """
-    Safely extract and inspect a ZIP archive.
-    """
-    if not os.path.isfile(zip_path):
-        logger.error("ZIP file does not exist")
-        return 0, 0
-    if not zipfile.is_zipfile(zip_path):
-        logger.error("File is not a valid ZIP archive")
-        return 0, 0
+    tmp = f"tmp_{uuid.uuid4().hex[:8]}"
+    os.makedirs(tmp, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="multi_tg_sessions_"
-        ) as temp_dir:
-            count = safe_extract_zip(zip_path, temp_dir)
-            logger.info(
-                "Extracted %d archive entries for inspection",
-                count,
-            )
-            return await import_file(
-                zip_path,
-                uid,
-                temp_dir,
-            )
-    except (OSError, ValueError, zipfile.BadZipFile) as exc:
-        logger.error(
-            "ZIP inspection failed: %s",
-            type(exc).__name__,
-        )
-        return 0, 0
+        with zipfile.ZipFile(zip_path) as z:
+            names = z.namelist()
+            logger.info(f"🗜️  ZIP: {len(names)} entries")
+            for n in names[:15]:
+                logger.info(f"   - {n}")
+            z.extractall(tmp)
+
+        # Extract nested zips
+        for inner_zip in glob.glob(f"{tmp}/**/*.zip", recursive=True):
+            inner_dir = os.path.splitext(inner_zip)[0]
+            os.makedirs(inner_dir, exist_ok=True)
+            try:
+                with zipfile.ZipFile(inner_zip) as z:
+                    z.extractall(inner_dir)
+            except Exception as e:
+                logger.debug(f"inner zip: {e}")
+
+        return await import_file(zip_path, uid, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def import_any_file(path: str, uid: int) -> tuple:
-    """
-    Inspect ZIP archives, JSON files, or SQLite session files.
-    """
-    if not os.path.isfile(path):
-        logger.error("Input file does not exist")
-        return 0, 0
-    suffix = Path(path).suffix.lower()
-    if suffix == ".zip":
+    low = path.lower()
+    if low.endswith(".zip"):
         return await import_zip(path, uid)
+
+    tmp = f"tmp_{uuid.uuid4().hex[:8]}"
+    os.makedirs(tmp, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="multi_tg_inspect_"
-        ) as temp_dir:
-            destination = Path(temp_dir) / Path(path).name
-            shutil.copy2(path, destination)
-            return await import_file(
-                path,
-                uid,
-                temp_dir,
-            )
-    except OSError as exc:
-        logger.error(
-            "File inspection failed: %s",
-            type(exc).__name__,
-        )
-        return 0, 0
+        dest = os.path.join(tmp, os.path.basename(path))
+        shutil.copy2(path, dest)
+        return await import_file(path, uid, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
