@@ -43,8 +43,8 @@ def register(bot):
         c.user_data[m.from_user.id] = {"step": "import_file"}
         await m.reply(
             "📦 **Send your file**\n\n"
-            "Supported:\n"
-            "• `.zip` with any mix of files\n"
+            "Supported formats:\n"
+            "• `.zip` (with any mix of files)\n"
             "• `.session` (Telethon SQLite)\n"
             "• `.json` (Telethon / Pyrogram / custom)\n"
             "• `.txt` (one session string per line)\n"
@@ -84,7 +84,9 @@ def register(bot):
         # ═══ FILE IMPORT ═══
         if step == "import_file" and (m.document or m.text):
             if m.document:
-                s = await m.reply("⏳ Downloading and importing...")
+                s = await m.reply(
+                    "⏳ **Downloading and importing...**\n\n"
+                    "_Check the VPS log for details._")
                 path = await m.download()
                 try:
                     ok, fail = await import_any_file(path, m.from_user.id)
@@ -92,7 +94,8 @@ def register(bot):
                         f"🏁 **Import Complete**\n\n"
                         f"✅ Imported: `{ok}`\n"
                         f"❌ Failed: `{fail}`\n\n"
-                        f"_Expired/dead sessions count as failed._")
+                        f"_Expired/dead sessions count as failed._\n"
+                        f"_Check VPS logs for per-file details._")
                 except Exception as e:
                     logger.exception(f"import error: {e}")
                     await s.edit_text(f"❌ Import error: `{e}`")
