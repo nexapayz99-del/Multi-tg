@@ -1,4 +1,4 @@
-"""auto_worker.py — pool + parallel reactions + proxy rotation"""
+"""auto_worker.py — persistent pool, fast parallel reactions"""
 import asyncio, random, uuid, time, logging
 from datetime import datetime
 from pyrogram import Client
@@ -10,13 +10,12 @@ from config import (
 )
 from database import all_accounts, auto_channels, seen_posts, settings
 from vc_joiner import auto_vc_worker
-from utils.proxy import get_proxy
 
 logger = logging.getLogger(__name__)
 _running_workers = {}
 _reaction_locks = {}
 
-MAX_POOL = 100
+MAX_POOL = 600
 _client_pool = {}
 _client_locks = {}
 
@@ -35,7 +34,6 @@ async def _get_client(phone, session):
         existing = _client_pool.get(phone)
         if existing and existing.is_connected:
             return existing
-
         if existing:
             try:
                 await existing.stop()
@@ -43,28 +41,14 @@ async def _get_client(phone, session):
                 pass
             _client_pool.pop(phone, None)
 
-        while len(_client_pool) >= MAX_POOL:
-            oldest_phone = next(iter(_client_pool))
-            old_app = _client_pool.pop(oldest_phone)
-            try:
-                await old_app.stop()
-            except Exception:
-                pass
-            logger.debug(f"pool: evicted {oldest_phone}")
-
-        # ⭐ Stable proxy per account
-        proxy = get_proxy(seed=phone)
-
         app = Client(
             f"pool_{phone[-6:]}",
             api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             in_memory=True, no_updates=True,
-            proxy=proxy,
         )
         await app.start()
         _client_pool[phone] = app
-        logger.debug(f"pool: +1 ({len(_client_pool)}/{MAX_POOL})")
         return app
 
 
@@ -98,23 +82,23 @@ async def _get_reactions():
 
 
 async def _react_and_view(app, peer, mid, emoji, cid):
-    """Reaction FIRST, then view. No global lock — allows parallel."""
-    try:
-        await app.invoke(SendReaction(
-            peer=peer, msg_id=mid,
-            reaction=[ReactionEmoji(emoticon=emoji)]
-        ))
-    except FloodWait as fw:
-        await asyncio.sleep(min(fw.value, 5))
-    except Exception as e:
-        logger.debug(f"react fail: {e}")
-
     try:
         await app.invoke(GetMessagesViews(peer=peer, id=[mid], increment=True))
     except FloodWait as fw:
         await asyncio.sleep(min(fw.value, 5))
     except Exception as e:
         logger.debug(f"view fail: {e}")
+
+    async with _get_lock(cid, mid):
+        try:
+            await app.invoke(SendReaction(
+                peer=peer, msg_id=mid,
+                reaction=[ReactionEmoji(emoticon=emoji)]
+            ))
+        except FloodWait as fw:
+            await asyncio.sleep(min(fw.value, 5))
+        except Exception as e:
+            logger.debug(f"react fail: {e}")
 
 
 async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
@@ -173,13 +157,11 @@ async def process_channel(ch_doc):
 
     recent_ids, cid = [], None
     try:
-        proxy = get_proxy(seed=accs[0]["phone"])
         async with Client(
             f"fetch_{uuid.uuid4().hex[:6]}",
             api_id=API_ID, api_hash=API_HASH,
             session_string=accs[0]["session"],
             in_memory=True, no_updates=True,
-            proxy=proxy,
         ) as app:
             try:
                 chat = await app.get_chat(chat_target)
@@ -227,7 +209,7 @@ async def process_channel(ch_doc):
                 f"PARALLEL reaction from {len(accs)} accounts")
     t0 = time.time()
 
-    STAGGER_WINDOW = 3.0
+    STAGGER_WINDOW = 2.0
     step = STAGGER_WINDOW / max(len(accs), 1)
 
     results = await asyncio.gather(
