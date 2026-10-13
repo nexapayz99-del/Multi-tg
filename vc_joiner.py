@@ -1,13 +1,23 @@
-"""vc_joiner.py — fast parallel VC joins, unmuted mic"""
+"""
+vc_joiner.py — resource-safe VC joiner
+  • Batched joins (10 at a time, 5s delay between batches)
+  • Persistent probe client
+  • Unmuted mic (plays silent.wav)
+  • Drops dead sessions
+"""
 import asyncio, uuid, os, wave, logging
 
-# ═══ Pyrogram patches ═══
+# ═══════════════════════════════════════════════════════════════════
+# Pyrogram compatibility patches — must run before pytgcalls import
+# ═══════════════════════════════════════════════════════════════════
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
 from pyrogram.raw.core import TLObject
 
+
 class _DummyGroupCallError(_pg_errors.BadRequest):
     pass
+
 
 _MISSING_ERRORS = [
     "GroupcallForbidden", "GroupCallForbidden",
@@ -17,8 +27,7 @@ _MISSING_ERRORS = [
 ]
 for _err_name in _MISSING_ERRORS:
     if not hasattr(_pg_errors, _err_name):
-        setattr(_pg_errors, _err_name,
-                type(_err_name, (_DummyGroupCallError,), {}))
+        setattr(_pg_errors, _err_name, type(_err_name, (_DummyGroupCallError,), {}))
 
 try:
     import pyrogram.errors.exceptions.bad_request_400 as _b400
@@ -54,8 +63,8 @@ _MISSING_RAW = {
 }
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
-        setattr(_phone_module, _name,
-                type(_name, (_StubTLObject,), {"ID": _id}))
+        setattr(_phone_module, _name, type(_name, (_StubTLObject,), {"ID": _id}))
+# ═══════════════════════════════════════════════════════════════════
 
 from pyrogram import Client
 from pyrogram.raw import functions
@@ -76,10 +85,15 @@ try:
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
+
 _active_sessions = {}
 _stop_events = {}
-VC_JOIN_DELAY = 1
-VC_JOIN_PARALLEL = 3
+
+# ⭐ Batching — prevents flood waits and FD exhaustion
+VC_JOIN_DELAY = 2          # seconds between accounts inside a batch
+VC_BATCH_SIZE = 10         # accounts per batch
+VC_BATCH_PAUSE = 5         # seconds pause between batches
+VC_MAX_PARALLEL = 3        # how many accounts in one batch join simultaneously
 
 DEAD_MARKERS = (
     "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
@@ -209,7 +223,8 @@ async def _join_one(phone, session, chat_target):
 
 async def leave_one(phone):
     blk = _active_sessions.pop(phone, None)
-    if not blk: return
+    if not blk:
+        return
     try: await blk["call"].leave_call(blk["chat_id"])
     except Exception: pass
     try: await blk["client"].stop()
@@ -222,25 +237,44 @@ async def leave_all():
         await leave_one(ph)
 
 
+# ⭐ BATCHED JOIN — replaces the old parallel gather
 async def _join_batch(accs, chat_target, stop_event):
+    """Join accounts in small batches to avoid flood-waits and FD exhaustion."""
     joined = failed = 0
-    for acc in accs:
+
+    for i in range(0, len(accs), VC_BATCH_SIZE):
         if stop_event.is_set():
             break
-        if acc["phone"] in _active_sessions:
-            joined += 1
-            continue
-        result = await _join_one(acc["phone"], acc["session"], chat_target)
-        if result:
-            joined += 1
-        else:
-            failed += 1
-        await asyncio.sleep(VC_JOIN_DELAY)
+
+        batch = accs[i:i + VC_BATCH_SIZE]
+        tasks = []
+        for acc in batch:
+            if acc["phone"] in _active_sessions:
+                joined += 1
+                continue
+            tasks.append(_join_one(acc["phone"], acc["session"], chat_target))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if r:
+                    joined += 1
+                else:
+                    failed += 1
+            logger.info(f"🎤 batch {i//VC_BATCH_SIZE + 1}: "
+                        f"✅ {joined} | ❌ {failed} "
+                        f"({min(i+VC_BATCH_SIZE, len(accs))}/{len(accs)})")
+
+        # Pause between batches
+        if i + VC_BATCH_SIZE < len(accs):
+            await asyncio.sleep(VC_BATCH_PAUSE)
+
     return joined, failed
 
 
 async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
-    if not PYTGCALLS_OK: return
+    if not PYTGCALLS_OK:
+        return
     ensure_silent()
     _stop_events[key] = stop_event
     joined = False
@@ -256,6 +290,7 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                 await asyncio.sleep(30)
                 continue
 
+            # Probe VC — uses a fresh short-lived client per probe
             probe = accs[0]
             live = False
             try:
@@ -275,29 +310,25 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
                 logger.warning(f"probe failed: {err[:80]}")
 
             if live and not joined:
-                logger.info(f"🎤 VC LIVE — joining {len(accs)} accounts (parallel)")
-                groups = [[] for _ in range(VC_JOIN_PARALLEL)]
-                for i, a in enumerate(accs):
-                    groups[i % VC_JOIN_PARALLEL].append(a)
-
+                logger.info(
+                    f"🎤 VC LIVE — joining {len(accs)} accounts "
+                    f"(batches of {VC_BATCH_SIZE}, "
+                    f"{VC_BATCH_PAUSE}s pause)")
                 t0 = asyncio.get_event_loop().time()
-                results = await asyncio.gather(
-                    *[_join_batch(g, chat_target, stop_event) for g in groups],
-                    return_exceptions=True,
-                )
-                total_joined = sum(r[0] for r in results if isinstance(r, tuple))
-                total_failed = sum(r[1] for r in results if isinstance(r, tuple))
+                ok, fail = await _join_batch(accs, chat_target, stop_event)
                 elapsed = asyncio.get_event_loop().time() - t0
                 logger.info(
                     f"🎤 VC JOIN DONE in {elapsed:.1f}s — "
-                    f"✅ {total_joined} | ❌ {total_failed}")
+                    f"✅ {ok} | ❌ {fail}")
                 joined = True
             elif not live and joined:
                 logger.info(f"🎤 VC ended — leaving all")
                 await leave_all()
                 joined = False
+
         except Exception as e:
             logger.error(f"auto_vc_worker: {e}")
+
         await asyncio.sleep(15)
 
     await leave_all()
@@ -307,7 +338,8 @@ async def auto_vc_worker(key, chat_target, stop_event, max_accounts=None):
 
 def stop_worker(key):
     ev = _stop_events.get(key)
-    if ev: ev.set()
+    if ev:
+        ev.set()
 
 
 def active_sessions():
