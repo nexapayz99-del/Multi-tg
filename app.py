@@ -45,8 +45,9 @@ logging.basicConfig(
 for _noisy in (
     "pyrogram.session.session", "pyrogram.connection.connection",
     "pyrogram.session.auth", "pyrogram.crypto.aes",
+    "pytgcalls",
 ):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 log = logging.getLogger("bot")
 
