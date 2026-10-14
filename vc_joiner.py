@@ -1,4 +1,4 @@
-"""vc_joiner.py — parallel VC joins (public + private), no proxy, flood-safe."""
+"""vc_joiner.py — join VC as silent listeners, no proxy, flood-safe."""
 import asyncio, uuid, os, wave, logging, time
 
 # ═══════════════════════════════════════════════════════════════
@@ -112,12 +112,8 @@ def _is_private_link(link: str) -> bool:
 
 
 def ensure_silent():
-    if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 1000:
-        return
-    with wave.open(SILENT_WAV, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
-        w.writeframes(b"\x00\x00" * 44100 * 5)
-    logger.info(f"✅ {SILENT_WAV} created")
+    """Legacy no-op — no audio stream is played."""
+    pass
 
 
 async def is_vc_live(app, chat_id) -> bool:
@@ -149,24 +145,6 @@ async def _drop_dead(phone, err=""):
         logger.warning(f"🗑 Dropped {phone} — {err[:80]}")
     except Exception:
         pass
-
-
-async def _play_unmuted(call_py, chat_id, media_path):
-    try:
-        stream = MediaStream(media_path)
-    except Exception as e:
-        logger.error(f"stream build: {e}")
-        return False
-    try:
-        await call_py.play(chat_id, stream)
-        try:
-            await call_py.unmute(chat_id)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        logger.error(f"play failed for {chat_id}: {str(e)[:100]}")
-        return False
 
 
 async def _resolve_and_join(app, chat_target, link, phone):
@@ -228,6 +206,10 @@ async def _resolve_and_join(app, chat_target, link, phone):
 
 
 async def _join_one(phone, session, chat_target, link=""):
+    """
+    Join the VC as a silent listener.
+    No audio stream, no unmute.
+    """
     app = None
     try:
         app = Client(
@@ -247,16 +229,14 @@ async def _join_one(phone, session, chat_target, link=""):
 
         call_py = PyTgCalls(app)
         await call_py.start()
-        played = await _play_unmuted(call_py, chat_id, SILENT_WAV)
-        if not played:
-            logger.warning(f"{phone}: play failed but staying in VC")
 
+        # No play, no unmute — pure listener
         _active_sessions[phone] = {
             "client": app,
             "call": call_py,
             "chat_id": chat_id,
         }
-        logger.info(f"🎤 {phone} JOINED VC: {chat_id}")
+        logger.info(f"🎧 {phone} joined VC (muted listener): {chat_id}")
         return chat_id
     except Exception as e:
         err = str(e)
@@ -305,7 +285,6 @@ async def auto_vc_worker(key, chat_target, stop_event,
                          max_accounts=None, is_private=False):
     if not PYTGCALLS_OK:
         return
-    ensure_silent()
     _stop_events[key] = stop_event
     joined = False
     probe_idx = 0
@@ -333,7 +312,6 @@ async def auto_vc_worker(key, chat_target, stop_event,
                     session_string=probe["session"],
                     in_memory=True, no_updates=True,
                 ) as pc:
-                    # PROBE ONLY — never join here
                     cid = None
                     if is_private:
                         if await has_joined(chat_target, probe["phone"]):
@@ -360,7 +338,7 @@ async def auto_vc_worker(key, chat_target, stop_event,
             if live and not joined:
                 logger.info(
                     f"🎤 VC LIVE — joining {len(accs)} accounts "
-                    f"in batches of {VC_BATCH_SIZE}")
+                    f"as silent listeners, batches of {VC_BATCH_SIZE}")
                 t0 = time.time()
                 total_ok = total_fail = 0
 
