@@ -1,4 +1,4 @@
-"""auto_worker.py — persistent pool, fast parallel reactions"""
+"""auto_worker.py — persistent pool, fast parallel reactions (public + private)."""
 import asyncio, random, uuid, time, logging
 from datetime import datetime
 from pyrogram import Client
@@ -8,7 +8,11 @@ from pyrogram.raw.types import ReactionEmoji
 from config import (
     API_ID, API_HASH, AUTO_POLL_INTERVAL, POSITIVE_REACTIONS,
 )
-from database import all_accounts, auto_channels, seen_posts, settings
+from database import (
+    all_accounts, auto_channels, seen_posts, settings,
+    mark_joined, has_joined, get_joined_set,
+    get_cached_chat_id, cache_chat_id,
+)
 from vc_joiner import auto_vc_worker
 
 logger = logging.getLogger(__name__)
@@ -19,12 +23,16 @@ MAX_POOL = 600
 _client_pool = {}
 _client_locks = {}
 
+# ⚠ Only TRUE session-death markers — never chat-resolution errors
 DEAD_MARKERS = (
-    "USERNAME_INVALID", "USER_DEACTIVATED", "SESSION_REVOKED",
-    "AUTH_KEY_UNREGISTERED", "USERNAME_NOT_OCCUPIED",
-    "PEER_ID_INVALID", "USER_ID_INVALID", "USER_BANNED",
-    "PHONE_NUMBER_BANNED", "USER_DEACTIVATED_BAN",
+    "USER_DEACTIVATED", "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED",
+    "USER_DEACTIVATED_BAN", "PHONE_NUMBER_BANNED", "USER_BANNED",
 )
+
+
+def _is_private_link(link: str) -> bool:
+    s = link.strip().lower()
+    return "/+" in s or "joinchat/" in s
 
 
 async def _get_client(phone, session):
@@ -53,9 +61,15 @@ async def _get_client(phone, session):
 
 
 async def _drop_dead(phone, err=""):
+    """Delete account ONLY on confirmed session death. Never on chat errors."""
+    if not any(m in err for m in DEAD_MARKERS):
+        logger.warning(
+            f"⚠️ Refusing to drop {phone} — err not confirmed dead: {err[:80]}")
+        return
     from database import accounts
     try:
         await accounts.delete_one({"phone": phone})
+        logger.warning(f"🗑 Dropped {phone} — {err[:80]}")
     except Exception:
         pass
     app = _client_pool.pop(phone, None)
@@ -64,7 +78,6 @@ async def _drop_dead(phone, err=""):
             await app.stop()
         except Exception:
             pass
-    logger.warning(f"🗑 Dropped {phone} — {err[:80]}")
 
 
 def _get_lock(cid, mid):
@@ -101,34 +114,95 @@ async def _react_and_view(app, peer, mid, emoji, cid):
             logger.debug(f"react fail: {e}")
 
 
+async def _resolve_peer_for(app, chat_target, link, phone):
+    """
+    Try to resolve chat_target. If private (or get_chat fails), join first.
+    Returns (peer, chat_id) or (None, None).
+    """
+    is_private = _is_private_link(link)
+
+    # Try cached chat_id first (private channels)
+    if is_private:
+        cached_id, _ = await get_cached_chat_id(link)
+        if cached_id:
+            try:
+                return await app.resolve_peer(cached_id), cached_id
+            except Exception:
+                pass  # fall through to fresh resolve
+
+    # Try direct get_chat
+    try:
+        chat = await app.get_chat(chat_target)
+        return await app.resolve_peer(chat.id), chat.id
+    except Exception as e:
+        err = str(e)
+        if any(m in err for m in DEAD_MARKERS):
+            await _drop_dead(phone, err)
+            return None, None
+        logger.debug(f"get_chat failed for {phone}: {err[:80]}")
+
+    # Public channel: try join_chat(@username) — becomes member
+    # Private channel: join_chat(invite_link)
+    try:
+        await app.join_chat(chat_target)
+    except UserAlreadyParticipant:
+        pass
+    except FloodWait as fw:
+        logger.warning(f"⚠️ {phone} FLOOD_WAIT {fw.value}s joining {chat_target}")
+        await asyncio.sleep(min(fw.value, 30))
+        try:
+            await app.join_chat(chat_target)
+        except Exception as e2:
+            logger.debug(f"join retry failed {phone}: {str(e2)[:80]}")
+    except Exception as e:
+        err = str(e)
+        if any(m in err for m in DEAD_MARKERS):
+            await _drop_dead(phone, err)
+            return None, None
+        logger.debug(f"join_chat failed for {phone}: {err[:80]}")
+
+    # After join, resolve again
+    try:
+        chat = await app.get_chat(chat_target)
+        cid = chat.id
+        if is_private:
+            await cache_chat_id(link, cid, getattr(chat, "title", ""))
+        await mark_joined(link, phone)
+        return await app.resolve_peer(cid), cid
+    except Exception as e:
+        err = str(e)
+        if any(m in err for m in DEAD_MARKERS):
+            await _drop_dead(phone, err)
+        logger.debug(f"post-join get_chat failed {phone}: {err[:80]}")
+        return None, None
+
+
 async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
-                             start_delay=0.0):
+                             link, start_delay=0.0):
     phone = acc.get("phone")
     if start_delay > 0:
         await asyncio.sleep(start_delay)
 
     try:
         app = await _get_client(phone, acc["session"])
-        try:
-            peer = await app.resolve_peer(cid)
-        except Exception as e:
-            err = str(e)
-            if any(m in err for m in DEAD_MARKERS):
-                await _drop_dead(phone, err)
+
+        # If account already joined a private channel, skip expensive get_chat
+        peer = None
+        if _is_private_link(link):
+            if await has_joined(link, phone):
+                cached_id, _ = await get_cached_chat_id(link)
+                if cached_id:
+                    try:
+                        peer = await app.resolve_peer(cached_id)
+                    except Exception:
+                        peer = None
+
+        if peer is None:
+            peer, resolved_cid = await _resolve_peer_for(app, chat_target,
+                                                         link, phone)
+            if peer is None:
                 return False
-            try:
-                await app.join_chat(chat_target)
-            except UserAlreadyParticipant:
-                pass
-            except Exception:
-                pass
-            try:
-                chat = await app.get_chat(chat_target)
-                peer = await app.resolve_peer(chat.id)
-            except Exception as e2:
-                if any(m in str(e2) for m in DEAD_MARKERS):
-                    await _drop_dead(phone, str(e2))
-                return False
+            cid = resolved_cid
 
         tasks = [
             _react_and_view(app, peer, mid, random.choice(reactions), cid)
@@ -142,7 +216,6 @@ async def _react_one_account(acc, chat_target, cid, new_ids, reactions,
             await _drop_dead(phone, err)
         else:
             logger.debug(f"react err {phone}: {err[:80]}")
-        _client_pool.pop(phone, None)
         return False
 
 
@@ -156,6 +229,9 @@ async def process_channel(ch_doc):
     reactions = await _get_reactions()
 
     recent_ids, cid = [], None
+    # Try cached chat_id first
+    cached_id, _ = await get_cached_chat_id(link)
+    probe_client = None
     try:
         async with Client(
             f"fetch_{uuid.uuid4().hex[:6]}",
@@ -163,16 +239,13 @@ async def process_channel(ch_doc):
             session_string=accs[0]["session"],
             in_memory=True, no_updates=True,
         ) as app:
-            try:
-                chat = await app.get_chat(chat_target)
-            except Exception:
-                try:
-                    await app.join_chat(chat_target)
-                    chat = await app.get_chat(chat_target)
-                except Exception as e:
-                    logger.debug(f"reach fail {chat_target}: {e}")
-                    return
-            cid = chat.id
+            probe_client = app
+            # Resolve — for private, one account joins so we can read history
+            peer, cid = await _resolve_peer_for(app, chat_target, link,
+                                                accs[0]["phone"])
+            if peer is None:
+                logger.debug(f"cannot resolve {chat_target}")
+                return
             async for msg in app.get_chat_history(cid, limit=10):
                 if msg.id:
                     recent_ids.append(msg.id)
@@ -214,7 +287,7 @@ async def process_channel(ch_doc):
 
     results = await asyncio.gather(
         *[_react_one_account(a, chat_target, cid, new_ids, reactions,
-                             start_delay=i * step)
+                             link, start_delay=i * step)
           for i, a in enumerate(accs)],
         return_exceptions=True,
     )
@@ -230,7 +303,9 @@ async def _ensure_vc_worker(doc):
     if key in _running_workers and not _running_workers[key].done():
         return
     ev = asyncio.Event()
-    task = asyncio.create_task(auto_vc_worker(key, doc["link"], ev))
+    task = asyncio.create_task(
+        auto_vc_worker(key, doc["link"], ev, is_private=_is_private_link(doc["link"]))
+    )
     _running_workers[key] = task
     logger.info(f"🎤 spawned VC worker for {doc['link']}")
 
