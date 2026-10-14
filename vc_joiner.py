@@ -1,12 +1,11 @@
 """vc_joiner.py — parallel VC joins (public + private), no proxy, flood-safe."""
-import asyncio, uuid, os, wave, logging, time
+import asyncio, uuid, os, wave, logging, time, sys
 
 # ═══════════════════════════════════════════════════════════════
 # Pyrogram patches — MUST run before pytgcalls uses raw types
 # ═══════════════════════════════════════════════════════════════
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
-import pyrogram.raw.types as _raw_types
 from pyrogram.raw.core import TLObject
 
 
@@ -41,50 +40,77 @@ except Exception:
     pass
 
 
-# ── Stub TLObject base ──
+# ── Base stub that stores attrs and is safe for both read/write ──
 class _StubTLObject(TLObject):
     ID = 0
-    def __init__(self, *a, **k):
-        # accept anything, store as attrs
-        for i, v in enumerate(a):
+    def __init__(self, *args, **kwargs):
+        for i, v in enumerate(args):
             setattr(self, f"_arg{i}", v)
-        for k_, v in k.items():
-            setattr(self, k_, v)
-    def write(self): return b""
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+    def write(self):
+        return b""
     @classmethod
-    def read(cls, *a, **k): return None
+    def read(cls, *args, **kwargs):
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. Patch missing RAW TYPES (pyrogram.raw.types)
+# 1. Patch missing RAW TYPES (pyrogram.raw.types package)
 # ═══════════════════════════════════════════════════════════════
+def _inject_type(name: str, tl_id: int):
+    """Add a missing class to pyrogram.raw.types AND its __all__ list."""
+    cls = type(name, (_StubTLObject,), {"ID": tl_id})
+    # Ensure the submodule is imported & in sys.modules
+    mod = sys.modules.get("pyrogram.raw.types")
+    if mod is None:
+        import pyrogram.raw.types as mod  # noqa
+        mod = sys.modules["pyrogram.raw.types"]
+    setattr(mod, name, cls)
+    # Patch __all__ if present
+    if hasattr(mod, "__all__") and name not in mod.__all__:
+        try:
+            mod.__all__ = list(mod.__all__) + [name]
+        except Exception:
+            pass
+    return cls
+
+
+# Names pytgcalls 2.1.0 imports from pyrogram.raw.types
 _MISSING_TYPES = {
-    # name: TL ID (hex)
-    "InputGroupCallInviteMessage":       0x2b95d4e2,
-    "InputGroupCallStream":              0x05962a4b,
-    "GroupCallParticipantVideo":         0x67753ac8,
-    "GroupCallParticipantVideoSource":   0xa04c05c5,
-    "GroupCallStreamChannel":            0x80eb48af,
-    "InputGroupCallSlug":                0xfe06823f,
-    "InputGroupCallInviteMessageByLink": 0x8e5e0e5c,
-    "InputGroupCall":                    0xd8aa840f,  # safety
+    "InputGroupCallInviteMessage":        0x2b95d4e2,
+    "InputGroupCallStream":               0x05962a4b,
+    "InputGroupCallSlug":                 0xfe06823f,
+    "InputGroupCallInviteMessageByLink":  0x8e5e0e5c,
+    "GroupCallParticipantVideo":          0x67753ac8,
+    "GroupCallParticipantVideoSource":    0xa04c05c5,
+    "GroupCallStreamChannel":             0x80eb48af,
+    "InputGroupCall":                     0xd8aa840f,
+    # extras pytgcalls may lazily import
+    "InputPeerChat":                      0x35a95cb9,  # safety net
+    "GroupCall":                          0xefb2b91b,
+    "GroupCallParticipant":               0xeba636fe,
+    "InputGroupCallStreamFolder":         0xa3510364,
 }
 for _name, _id in _MISSING_TYPES.items():
-    if not hasattr(_raw_types, _name):
-        setattr(_raw_types, _name,
-                type(_name, (_StubTLObject,), {"ID": _id}))
-
-# Also add to parent raw module for good measure
-import pyrogram.raw as _raw_parent
-for _name, _id in _MISSING_TYPES.items():
-    if not hasattr(_raw_parent, _name):
-        setattr(_raw_parent, _name,
-                type(_name, (_StubTLObject,), {"ID": _id}))
+    if not hasattr(sys.modules.get("pyrogram.raw.types", object()), _name):
+        _inject_type(_name, _id)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 2. Patch missing RAW FUNCTIONS (pyrogram.raw.functions.phone)
 # ═══════════════════════════════════════════════════════════════
+def _inject_func(name: str, tl_id: int):
+    cls = type(name, (_StubTLObject,), {"ID": tl_id})
+    # phone submodule
+    setattr(_phone_module, name, cls)
+    # Also register under the top-level functions package
+    import pyrogram.raw.functions as fns  # noqa
+    if not hasattr(fns, name):
+        setattr(fns, name, cls)
+    return cls
+
+
 _MISSING_RAW = {
     "GetGroupCallChainBlocks":              0xeeee22cc,
     "CreateConferenceCall":                 0x7d0444bb,
@@ -96,6 +122,7 @@ _MISSING_RAW = {
     "SendConferenceCallBroadcast":          0xc9b7fbd3,
     "DeleteConferenceCallParticipants":     0x8ca60525,
     "GetGroupCallJoinAs":                   0xef7c213a,
+    "GetGroupCall":                         0x041845db,
     "JoinGroupCall":                        0xb132ff7b,
     "LeaveGroupCall":                       0x500377f9,
     "EditGroupCallParticipant":             0xa5273abf,
@@ -109,19 +136,20 @@ _MISSING_RAW = {
 }
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
-        setattr(_phone_module, _name,
-                type(_name, (_StubTLObject,), {"ID": _id}))
+        _inject_func(_name, _id)
 
-# Mirror under pyrogram.raw.functions
-import pyrogram.raw.functions as _raw_funcs
-for _name, _id in _MISSING_RAW.items():
-    if not hasattr(_raw_funcs, _name):
-        setattr(_raw_funcs, _name,
-                type(_name, (_StubTLObject,), {"ID": _id}))
 
 logger = logging.getLogger(__name__)
-logger.info("🔧 Pyrogram GroupCall patches applied "
-            "(types + functions)")
+logger.info("🔧 Pyrogram GroupCall patches applied (types + functions)")
+
+# Sanity check the patches actually stuck
+_miss_types = [n for n in _MISSING_TYPES
+               if not hasattr(sys.modules["pyrogram.raw.types"], n)]
+_miss_funcs = [n for n in _MISSING_RAW if not hasattr(_phone_module, n)]
+if _miss_types or _miss_funcs:
+    logger.error(f"❌ patch failed — types:{_miss_types} funcs:{_miss_funcs}")
+else:
+    logger.info("✅ all patches confirmed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -152,12 +180,9 @@ from database import (
 _active_sessions = {}
 _stop_events = {}
 
-# Batch tuning
-VC_BATCH_SIZE  = 5      # joins at a time
-VC_BATCH_DELAY = 3      # seconds between batches
-VC_JOIN_DELAY  = 1      # delay inside a batch (per worker)
+VC_BATCH_SIZE  = 5
+VC_BATCH_DELAY = 3
 
-# ⚠ Only TRUE session-death markers
 DEAD_MARKERS = (
     "USER_DEACTIVATED", "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED",
     "USER_DEACTIVATED_BAN", "PHONE_NUMBER_BANNED", "USER_BANNED",
@@ -230,10 +255,6 @@ async def _play_unmuted(call_py, chat_id, media_path):
 
 
 async def _resolve_and_join(app, chat_target, link, phone):
-    """
-    Resolve chat, join if needed. Respects flood_until.
-    Returns chat.id or None.
-    """
     flood_until = await get_flood_until(phone)
     if flood_until > time.time():
         logger.info(f"   ⏳ {phone} flood for "
@@ -247,7 +268,6 @@ async def _resolve_and_join(app, chat_target, link, phone):
         if cached_id:
             return cached_id
 
-    # Direct resolve
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
@@ -261,7 +281,6 @@ async def _resolve_and_join(app, chat_target, link, phone):
             await _drop_dead(phone, err)
             return None
 
-    # Join
     try:
         await app.join_chat(chat_target)
         logger.info(f"   ✅ {phone} joined {chat_target}")
@@ -279,7 +298,6 @@ async def _resolve_and_join(app, chat_target, link, phone):
             return None
         logger.debug(f"   join failed {phone}: {err[:80]}")
 
-    # Post-join resolve
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
@@ -305,7 +323,8 @@ async def _join_one(phone, session, chat_target, link=""):
         )
         await app.start()
 
-        chat_id = await _resolve_and_join(app, chat_target, link or chat_target, phone)
+        chat_id = await _resolve_and_join(app, chat_target,
+                                          link or chat_target, phone)
         if chat_id is None:
             try: await app.stop()
             except Exception: pass
@@ -352,7 +371,6 @@ async def leave_all():
 
 
 async def _join_batch(accs, chat_target, link, stop_event):
-    """Join a batch — all 5 in parallel."""
     tasks = []
     for acc in accs:
         if stop_event.is_set():
@@ -422,9 +440,8 @@ async def auto_vc_worker(key, chat_target, stop_event,
                         batch, chat_target, chat_target, stop_event)
                     total_ok += ok
                     total_fail += fail
-                    logger.info(
-                        f"   batch {i//VC_BATCH_SIZE + 1}: "
-                        f"✅ {ok} | ❌ {fail}")
+                    logger.info(f"   batch {i//VC_BATCH_SIZE + 1}: "
+                                f"✅ {ok} | ❌ {fail}")
                     if i + VC_BATCH_SIZE < len(accs):
                         await asyncio.sleep(VC_BATCH_DELAY)
 
