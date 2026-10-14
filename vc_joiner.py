@@ -1,4 +1,7 @@
-"""vc_joiner.py — join VC (public + private), silent listener, pytgcalls 2.1.0"""
+cat > ~/Multi-tg/vc_joiner.py << 'PYEOF'
+"""vc_joiner.py — public + private VC join as silent listeners.
+Works with py-tgcalls 3.x + pyrogram 2.0.106 (block= kwarg wrapped by sitecustomize).
+"""
 import asyncio, uuid, os, wave, logging, time
 
 from pyrogram import Client
@@ -20,10 +23,11 @@ try:
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
     PYTGCALLS_OK = True
-    logger.info("✅ PyTgCalls 2.1.0 loaded")
+    logger.info("✅ PyTgCalls 3.x loaded")
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
+# Per-channel tracking: {key: {phone: block}}
 _active_sessions = {}
 _stop_events = {}
 
@@ -42,12 +46,18 @@ def _is_private_link(link: str) -> bool:
 
 
 def ensure_silent():
+    """Make sure silent.wav exists."""
     if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 1000:
         return
-    with wave.open(SILENT_WAV, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
-        w.writeframes(b"\x00\x00" * 44100 * 5)
-    logger.info(f"✅ {SILENT_WAV} created")
+    try:
+        with wave.open(SILENT_WAV, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+            w.writeframes(b"\x00\x00" * 44100 * 5)
+        logger.info(f"✅ {SILENT_WAV} created")
+    except Exception as e:
+        logger.error(f"❌ silent.wav create failed: {e}")
 
 
 async def is_vc_live(app, chat_id) -> bool:
@@ -84,7 +94,7 @@ async def _drop_dead(phone, err=""):
 async def _resolve_and_join(app, chat_target, link, phone):
     flood_until = await get_flood_until(phone)
     if flood_until > time.time():
-        logger.info(f"   ⏳ {phone} flood for {int(flood_until-time.time())}s")
+        logger.info(f"   ⏳ {phone} flood {int(flood_until-time.time())}s")
         return None
 
     is_private = _is_private_link(link)
@@ -112,8 +122,7 @@ async def _resolve_and_join(app, chat_target, link, phone):
     except UserAlreadyParticipant:
         pass
     except FloodWait as fw:
-        until = time.time() + fw.value
-        await set_flood_until(phone, until)
+        await set_flood_until(phone, time.time() + fw.value)
         logger.warning(f"   ⚠️ {phone} FLOOD_WAIT {fw.value}s")
         return None
     except Exception as e:
@@ -133,7 +142,34 @@ async def _resolve_and_join(app, chat_target, link, phone):
         return None
 
 
-async def _join_one(phone, session, chat_target, link=""):
+async def _real_join(call_py, chat_id) -> bool:
+    """
+    Actually make the account appear in the VC.
+    py-tgcalls v3 uses .play(chat_id, MediaStream(path)) — a real path.
+    """
+    try:
+        stream = MediaStream(SILENT_WAV)
+    except Exception as e:
+        logger.error(f"   MediaStream build failed: {e}")
+        return False
+
+    try:
+        await call_py.play(chat_id, stream)
+        logger.info(f"   ✅ play({chat_id}) OK")
+        return True
+    except Exception as e:
+        err = str(e)
+        if "CHAT_ADMIN_REQUIRED" in err:
+            logger.info(f"   🎧 joined as listener ({chat_id})")
+            return True
+        if "GROUPCALL" in err.upper():
+            logger.info(f"   🎧 joined (no mic rights) ({chat_id})")
+            return True
+        logger.error(f"   play failed: {err[:150]}")
+        return False
+
+
+async def _join_one(phone, session, chat_target, link="", key=""):
     app = None
     try:
         app = Client(
@@ -144,7 +180,8 @@ async def _join_one(phone, session, chat_target, link=""):
         )
         await app.start()
 
-        chat_id = await _resolve_and_join(app, chat_target, link or chat_target, phone)
+        chat_id = await _resolve_and_join(app, chat_target,
+                                          link or chat_target, phone)
         if chat_id is None:
             try: await app.stop()
             except Exception: pass
@@ -153,27 +190,24 @@ async def _join_one(phone, session, chat_target, link=""):
         call_py = PyTgCalls(app)
         await call_py.start()
 
-        # Play silent WAV to actually join the VC
-        try:
-            stream = MediaStream(SILENT_WAV)
-            await call_py.play(chat_id, stream)
+        ok = await _real_join(call_py, chat_id)
+        if not ok:
+            logger.warning(f"⚠️ {phone}: VC join failed on {chat_target}")
             try:
-                await call_py.unmute(chat_id)
+                await call_py.leave_call(chat_id)
             except Exception:
                 pass
-            logger.info(f"🎧 {phone} JOINED VC {chat_target}: {chat_id}")
-        except Exception as e:
-            err = str(e)
-            if "CHAT_ADMIN_REQUIRED" in err:
-                logger.info(f"🎧 {phone} joined as listener (no mic rights)")
-            else:
-                logger.warning(f"⚠️ {phone} play failed: {err[:100]}")
+            try: await app.stop()
+            except Exception: pass
+            return None
 
-        _active_sessions[phone] = {
+        _active_sessions.setdefault(key, {})[phone] = {
             "client": app,
             "call": call_py,
             "chat_id": chat_id,
+            "target": chat_target,
         }
+        logger.info(f"🎧 {phone} joined VC {chat_target}: {chat_id}")
         return chat_id
     except Exception as e:
         err = str(e)
@@ -187,31 +221,45 @@ async def _join_one(phone, session, chat_target, link=""):
         return None
 
 
-async def leave_one(phone):
-    blk = _active_sessions.pop(phone, None)
-    if not blk: return
-    try: await blk["call"].leave_call(blk["chat_id"])
-    except Exception: pass
-    try: await blk["client"].stop()
-    except Exception: pass
-    logger.info(f"🚪 {phone} left VC")
+async def leave_one(phone, key=""):
+    bucket = _active_sessions.get(key, {})
+    blk = bucket.pop(phone, None)
+    if not blk:
+        return
+    try:
+        await blk["call"].leave_call(blk["chat_id"])
+    except Exception:
+        pass
+    try:
+        await blk["client"].stop()
+    except Exception:
+        pass
+    logger.info(f"🚪 {phone} left VC {blk.get('target','')}")
 
 
-async def leave_all():
-    for ph in list(_active_sessions.keys()):
-        await leave_one(ph)
+async def leave_all(key=""):
+    if key:
+        for ph in list(_active_sessions.get(key, {}).keys()):
+            await leave_one(ph, key)
+        _active_sessions.pop(key, None)
+    else:
+        for k in list(_active_sessions.keys()):
+            for ph in list(_active_sessions[k].keys()):
+                await leave_one(ph, k)
+            _active_sessions.pop(k, None)
 
 
-async def _join_batch(accs, chat_target, link, stop_event):
+async def _join_batch(accs, chat_target, link, stop_event, key):
+    bucket = _active_sessions.setdefault(key, {})
     tasks = []
     for acc in accs:
         if stop_event.is_set():
             break
         phone = acc["phone"]
-        if phone in _active_sessions:
+        if phone in bucket:
             continue
         tasks.append(asyncio.create_task(
-            _join_one(phone, acc["session"], chat_target, link)))
+            _join_one(phone, acc["session"], chat_target, link, key)))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     ok = sum(1 for r in results if isinstance(r, int))
@@ -224,6 +272,7 @@ async def auto_vc_worker(key, chat_target, stop_event,
         return
     ensure_silent()
     _stop_events[key] = stop_event
+    _active_sessions.setdefault(key, {})
     joined = False
     probe_idx = 0
     logger.info(f"🎤 VC worker started: {chat_target} (private={is_private})")
@@ -280,10 +329,11 @@ async def auto_vc_worker(key, chat_target, stop_event,
                     if stop_event.is_set():
                         break
                     batch = accs[i:i + VC_BATCH_SIZE]
-                    ok, fail = await _join_batch(batch, chat_target, chat_target, stop_event)
+                    ok, fail = await _join_batch(batch, chat_target,
+                                                 chat_target, stop_event, key)
                     total_ok += ok
                     total_fail += fail
-                    logger.info(f"   batch {i//VC_BATCH_SIZE + 1}: ✅ {ok} | ❌ {fail}")
+                    logger.info(f"   {chat_target} batch {i//VC_BATCH_SIZE + 1}: ✅ {ok} | ❌ {fail}")
                     if i + VC_BATCH_SIZE < len(accs):
                         await asyncio.sleep(VC_BATCH_DELAY)
 
@@ -291,21 +341,28 @@ async def auto_vc_worker(key, chat_target, stop_event,
                 joined = True
             elif not live and joined:
                 logger.info(f"🎤 VC ended {chat_target} — leaving")
-                await leave_all()
+                await leave_all(key)
                 joined = False
         except Exception as e:
             logger.error(f"auto_vc_worker: {e}")
         await asyncio.sleep(15)
 
-    await leave_all()
+    await leave_all(key)
     _stop_events.pop(key, None)
     logger.info(f"🎤 VC worker stopped: {chat_target}")
 
 
 def stop_worker(key):
     ev = _stop_events.get(key)
-    if ev: ev.set()
+    if ev:
+        ev.set()
 
 
-def active_sessions():
-    return dict(_active_sessions)
+def active_sessions(key=None):
+    if key:
+        return dict(_active_sessions.get(key, {}))
+    total = {}
+    for bucket in _active_sessions.values():
+        total.update(bucket)
+    return total
+PYEOF
