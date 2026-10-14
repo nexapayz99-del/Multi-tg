@@ -106,3 +106,27 @@ async def cache_chat_id(link: str, chat_id: int, title: str = ""):
         {"$set": {"chat_id": chat_id, "title": title or ""}},
         upsert=False,
     )
+    
+    # ═══════════════════════════════════════════════════════════════
+# FLOOD TRACKING
+# ═══════════════════════════════════════════════════════════════
+flood_state = db["flood_state"]  # add near the other collection defs
+
+
+async def set_flood_until(phone: str, until_ts: float):
+    await flood_state.update_one(
+        {"phone": phone},
+        {"$set": {"until": until_ts}},
+        upsert=True,
+    )
+
+
+async def get_flood_until(phone: str) -> float:
+    doc = await flood_state.find_one({"phone": phone})
+    if doc:
+        until = doc.get("until", 0)
+        # auto-clean past entries
+        if until < __import__("time").time():
+            return 0
+        return until
+    return 0
