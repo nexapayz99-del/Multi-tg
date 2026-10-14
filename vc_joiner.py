@@ -1,6 +1,6 @@
 cat > ~/Multi-tg/vc_joiner.py << 'PYEOF'
 """vc_joiner.py — public + private VC join as silent listeners.
-Works with py-tgcalls 3.x + pyrogram 2.0.106 (block= kwarg wrapped by sitecustomize).
+py-tgcalls 3.0.0 + pyrogram 2.0.106 (block= wrapped via sitecustomize).
 """
 import asyncio, uuid, os, wave, logging, time
 
@@ -23,11 +23,10 @@ try:
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
     PYTGCALLS_OK = True
-    logger.info("✅ PyTgCalls 3.x loaded")
+    logger.info("✅ PyTgCalls 3.0.0 loaded")
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
-# Per-channel tracking: {key: {phone: block}}
 _active_sessions = {}
 _stop_events = {}
 
@@ -46,7 +45,6 @@ def _is_private_link(link: str) -> bool:
 
 
 def ensure_silent():
-    """Make sure silent.wav exists."""
     if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 1000:
         return
     try:
@@ -143,10 +141,6 @@ async def _resolve_and_join(app, chat_target, link, phone):
 
 
 async def _real_join(call_py, chat_id) -> bool:
-    """
-    Actually make the account appear in the VC.
-    py-tgcalls v3 uses .play(chat_id, MediaStream(path)) — a real path.
-    """
     try:
         stream = MediaStream(SILENT_WAV)
     except Exception as e:
@@ -163,7 +157,7 @@ async def _real_join(call_py, chat_id) -> bool:
             logger.info(f"   🎧 joined as listener ({chat_id})")
             return True
         if "GROUPCALL" in err.upper():
-            logger.info(f"   🎧 joined (no mic rights) ({chat_id})")
+            logger.info(f"   🎧 joined (no mic) ({chat_id})")
             return True
         logger.error(f"   play failed: {err[:150]}")
         return False
@@ -193,10 +187,8 @@ async def _join_one(phone, session, chat_target, link="", key=""):
         ok = await _real_join(call_py, chat_id)
         if not ok:
             logger.warning(f"⚠️ {phone}: VC join failed on {chat_target}")
-            try:
-                await call_py.leave_call(chat_id)
-            except Exception:
-                pass
+            try: await call_py.leave_call(chat_id)
+            except Exception: pass
             try: await app.stop()
             except Exception: pass
             return None
@@ -226,14 +218,10 @@ async def leave_one(phone, key=""):
     blk = bucket.pop(phone, None)
     if not blk:
         return
-    try:
-        await blk["call"].leave_call(blk["chat_id"])
-    except Exception:
-        pass
-    try:
-        await blk["client"].stop()
-    except Exception:
-        pass
+    try: await blk["call"].leave_call(blk["chat_id"])
+    except Exception: pass
+    try: await blk["client"].stop()
+    except Exception: pass
     logger.info(f"🚪 {phone} left VC {blk.get('target','')}")
 
 
