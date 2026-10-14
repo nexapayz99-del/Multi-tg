@@ -1,8 +1,8 @@
 """vc_joiner.py — parallel VC joins (public + private), no proxy, flood-safe."""
-import asyncio, uuid, os, wave, logging, time, sys
+import asyncio, uuid, os, wave, logging, time
 
 # ═══════════════════════════════════════════════════════════════
-# Pyrogram patches — MUST run before pytgcalls uses raw types
+# Pyrogram patches — must run before pytgcalls imports
 # ═══════════════════════════════════════════════════════════════
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
@@ -40,131 +40,34 @@ except Exception:
     pass
 
 
-# ── Base stub that stores attrs and is safe for both read/write ──
 class _StubTLObject(TLObject):
     ID = 0
-    def __init__(self, *args, **kwargs):
-        for i, v in enumerate(args):
+    def __init__(self, *a, **k):
+        for i, v in enumerate(a):
             setattr(self, f"_arg{i}", v)
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-    def write(self):
-        return b""
+        for kk, vv in k.items():
+            setattr(self, kk, vv)
+    def write(self): return b""
     @classmethod
-    def read(cls, *args, **kwargs):
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════
-# 1. Patch missing RAW TYPES (pyrogram.raw.types package)
-# ═══════════════════════════════════════════════════════════════
-def _inject_type(name: str, tl_id: int):
-    """Add a missing class to pyrogram.raw.types AND its __all__ list."""
-    cls = type(name, (_StubTLObject,), {"ID": tl_id})
-    # Ensure the submodule is imported & in sys.modules
-    mod = sys.modules.get("pyrogram.raw.types")
-    if mod is None:
-        import pyrogram.raw.types as mod  # noqa
-        mod = sys.modules["pyrogram.raw.types"]
-    setattr(mod, name, cls)
-    # Patch __all__ if present
-    if hasattr(mod, "__all__") and name not in mod.__all__:
-        try:
-            mod.__all__ = list(mod.__all__) + [name]
-        except Exception:
-            pass
-    return cls
-
-
-# Names pytgcalls 2.1.0 imports from pyrogram.raw.types
-_MISSING_TYPES = {
-    "InputGroupCallInviteMessage":        0x2b95d4e2,
-    "InputGroupCallStream":               0x05962a4b,
-    "InputGroupCallSlug":                 0xfe06823f,
-    "InputGroupCallInviteMessageByLink":  0x8e5e0e5c,
-    "GroupCallParticipantVideo":          0x67753ac8,
-    "GroupCallParticipantVideoSource":    0xa04c05c5,
-    "GroupCallStreamChannel":             0x80eb48af,
-    "InputGroupCall":                     0xd8aa840f,
-    # extras pytgcalls may lazily import
-    "InputPeerChat":                      0x35a95cb9,  # safety net
-    "GroupCall":                          0xefb2b91b,
-    "GroupCallParticipant":               0xeba636fe,
-    "InputGroupCallStreamFolder":         0xa3510364,
-}
-for _name, _id in _MISSING_TYPES.items():
-    if not hasattr(sys.modules.get("pyrogram.raw.types", object()), _name):
-        _inject_type(_name, _id)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 2. Patch missing RAW FUNCTIONS (pyrogram.raw.functions.phone)
-# ═══════════════════════════════════════════════════════════════
-def _inject_func(name: str, tl_id: int):
-    cls = type(name, (_StubTLObject,), {"ID": tl_id})
-    # phone submodule
-    setattr(_phone_module, name, cls)
-    # Also register under the top-level functions package
-    import pyrogram.raw.functions as fns  # noqa
-    if not hasattr(fns, name):
-        setattr(fns, name, cls)
-    return cls
+    def read(cls, *a, **k): return None
 
 
 _MISSING_RAW = {
-    "GetGroupCallChainBlocks":              0xeeee22cc,
-    "CreateConferenceCall":                 0x7d0444bb,
-    "GetGroupCallStreamChannels":           0x1ab21940,
-    "GetGroupCallStreamRtmpUrl":            0xc5c1c8f4,
-    "SendGroupCallMessage":                 0xee1f9b1f,
-    "SendGroupCallEncryptedMessage":        0xf5f1e4b1,
-    "InviteConferenceCallParticipant":      0x4b6d4b8a,
-    "SendConferenceCallBroadcast":          0xc9b7fbd3,
-    "DeleteConferenceCallParticipants":     0x8ca60525,
-    "GetGroupCallJoinAs":                   0xef7c213a,
-    "GetGroupCall":                         0x041845db,
-    "JoinGroupCall":                        0xb132ff7b,
-    "LeaveGroupCall":                       0x500377f9,
-    "EditGroupCallParticipant":             0xa5273abf,
-    "EditGroupCallTitle":                   0x1ca6ac0a,
-    "ExportGroupCallInvite":                0xe6aa647f,
-    "StartScheduledGroupCall":              0x5680e342,
-    "ToggleGroupCallRecord":                0xc5cb7f63,
-    "StartGroupCallScreenSharing":          0x6e2b19ee,
-    "ToggleGroupCallSettings":              0x2191c008,
-    "DiscardGroupCall":                     0x7a777135,
+    "GetGroupCallChainBlocks":           0xeeee22cc,
+    "CreateConferenceCall":              0x7d0444bb,
+    "GetGroupCallStreamChannels":        0x1ab21940,
+    "GetGroupCallStreamRtmpUrl":         0xc5c1c8f4,
+    "SendGroupCallMessage":              0xee1f9b1f,
+    "SendGroupCallEncryptedMessage":     0xf5f1e4b1,
+    "InviteConferenceCallParticipant":   0x4b6d4b8a,
+    "SendConferenceCallBroadcast":       0xc9b7fbd3,
+    "DeleteConferenceCallParticipants":  0x8ca60525,
+    "GetGroupCallJoinAs":                0xef7c213a,
 }
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
-        _inject_func(_name, _id)
-
-
-logger = logging.getLogger(__name__)
-logger.info("🔧 Pyrogram GroupCall patches applied (types + functions)")
-
-# Sanity check the patches actually stuck
-_miss_types = [n for n in _MISSING_TYPES
-               if not hasattr(sys.modules["pyrogram.raw.types"], n)]
-_miss_funcs = [n for n in _MISSING_RAW if not hasattr(_phone_module, n)]
-if _miss_types or _miss_funcs:
-    logger.error(f"❌ patch failed — types:{_miss_types} funcs:{_miss_funcs}")
-else:
-    logger.info("✅ all patches confirmed")
-
-
-# ═══════════════════════════════════════════════════════════════
-# 3. Import pytgcalls AFTER patches
-# ═══════════════════════════════════════════════════════════════
-PyTgCalls = None
-MediaStream = None
-PYTGCALLS_OK = False
-try:
-    from pytgcalls import PyTgCalls
-    from pytgcalls.types import MediaStream
-    PYTGCALLS_OK = True
-    logger.info("✅ PyTgCalls loaded")
-except Exception as e:
-    logger.error(f"❌ PyTgCalls unavailable: {e}")
+        setattr(_phone_module, _name,
+                type(_name, (_StubTLObject,), {"ID": _id}))
 
 
 from pyrogram import Client
@@ -176,6 +79,20 @@ from database import (
     get_cached_chat_id, cache_chat_id,
     get_flood_until, set_flood_until,
 )
+
+logger = logging.getLogger(__name__)
+logger.info("🔧 Pyrogram GroupCall patches applied")
+
+PyTgCalls = None
+MediaStream = None
+PYTGCALLS_OK = False
+try:
+    from pytgcalls import PyTgCalls
+    from pytgcalls.types import MediaStream
+    PYTGCALLS_OK = True
+    logger.info("✅ PyTgCalls loaded")
+except Exception as e:
+    logger.error(f"❌ PyTgCalls unavailable: {e}")
 
 _active_sessions = {}
 _stop_events = {}
@@ -208,15 +125,13 @@ async def is_vc_live(app, chat_id) -> bool:
         peer = await app.resolve_peer(chat_id)
         try:
             full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-            call = getattr(full.full_chat, "call", None)
-            if call:
+            if getattr(full.full_chat, "call", None):
                 return True
         except Exception:
             pass
         try:
             full = await app.invoke(functions.messages.GetFullChat(chat_id=chat_id))
-            call = getattr(full.full_chat, "call", None)
-            if call:
+            if getattr(full.full_chat, "call", None):
                 return True
         except Exception:
             pass
@@ -393,6 +308,7 @@ async def auto_vc_worker(key, chat_target, stop_event,
     ensure_silent()
     _stop_events[key] = stop_event
     joined = False
+    probe_idx = 0
     logger.info(f"🎤 VC worker started: {chat_target} (private={is_private})")
 
     while not stop_event.is_set():
@@ -405,7 +321,10 @@ async def auto_vc_worker(key, chat_target, stop_event,
                 await asyncio.sleep(30)
                 continue
 
-            probe = accs[0]
+            # Rotate probe to spread load
+            probe = accs[probe_idx % len(accs)]
+            probe_idx += 1
+
             live = False
             try:
                 async with Client(
@@ -414,11 +333,24 @@ async def auto_vc_worker(key, chat_target, stop_event,
                     session_string=probe["session"],
                     in_memory=True, no_updates=True,
                 ) as pc:
-                    cid = await _resolve_and_join(pc, chat_target,
-                                                  chat_target, probe["phone"])
+                    # PROBE ONLY — never join here
+                    cid = None
+                    if is_private:
+                        if await has_joined(chat_target, probe["phone"]):
+                            cached_id, _ = await get_cached_chat_id(chat_target)
+                            if cached_id:
+                                cid = cached_id
+                    else:
+                        try:
+                            chat = await pc.get_chat(chat_target)
+                            cid = chat.id
+                        except Exception:
+                            cid = None
+
                     if cid:
                         live = await is_vc_live(pc, cid)
-                    logger.info(f"🎤 probe {chat_target}: live={live}")
+                    logger.info(f"🎤 probe {chat_target}: live={live} "
+                                f"(via …{probe['phone'][-4:]})")
             except Exception as e:
                 err = str(e)
                 if any(m in err for m in DEAD_MARKERS):
