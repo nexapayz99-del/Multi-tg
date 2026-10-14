@@ -14,6 +14,22 @@ def _no_input(prompt=""):
 _builtins.input = _no_input
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+# Silence ConnectionResetError storms from pytgcalls sockets
+# ═══════════════════════════════════════════════════════════
+import asyncio as _asyncio
+
+_orig_exc_handler = None
+
+
+def _silence_reset(loop, context):
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError):
+        return
+    if _orig_exc_handler:
+        _orig_exc_handler(loop, context)
+# ═══════════════════════════════════════════════════════════
+
 import asyncio, logging, io, os, time as _time
 from datetime import datetime
 from pyrogram import Client, filters, idle
@@ -47,7 +63,7 @@ for _noisy in (
     "pyrogram.session.auth", "pyrogram.crypto.aes",
     "pytgcalls",
 ):
-    logging.getLogger(_noisy).setLevel(logging.ERROR)
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger("bot")
 
@@ -401,7 +417,7 @@ async def _btn_ownerpanel(c, m):
 
 
 # ═══════════════════════════════════════════════════════════
-# OWNER CALLBACKS (backup + extras)
+# OWNER CALLBACKS
 # ═══════════════════════════════════════════════════════════
 @bot.on_callback_query(filters.regex(r"^own_(backup_info|restore|export|clear_flood)$"))
 async def _owner_backup_cb(c, q):
@@ -557,6 +573,14 @@ async def _daily_reset():
 
 
 async def _run():
+    global _orig_exc_handler
+    try:
+        loop = asyncio.get_running_loop()
+        _orig_exc_handler = loop.get_exception_handler()
+        loop.set_exception_handler(_silence_reset)
+    except Exception:
+        pass
+
     ensure_silent()
     log.info(f"🤖 Starting bot | OWNER_ID={OWNER_ID} | "
              f"Pool MAX={auto_worker.MAX_POOL}")
