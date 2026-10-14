@@ -5,10 +5,7 @@ import asyncio, uuid, os, wave, logging
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
 from pyrogram.raw.core import TLObject
-# ⭐ Concurrency limits — prevents FD exhaustion
-VC_SEM = asyncio.Semaphore(5)          # max 5 VC clients active at once
-VC_BATCH_SIZE = 5                       # join in batches of 5
-VC_BATCH_DELAY = 3                      # seconds between batches
+
 class _DummyGroupCallError(_pg_errors.BadRequest):
     pass
 
