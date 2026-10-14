@@ -1,20 +1,85 @@
-cat > ~/Multi-tg/vc_joiner.py << 'PYEOF'
 """vc_joiner.py — public + private VC join as silent listeners.
-py-tgcalls 3.0.0 + pyrogram 2.0.106 (block= wrapped via sitecustomize).
+py-tgcalls 3.0.0 + pyrogram 2.0.106.
 """
 import asyncio, uuid, os, wave, logging, time
+
+# ═══════════════════════════════════════════════════════════════
+# Pyrogram patches — MUST be first, before py-tgcalls imports.
+# ═══════════════════════════════════════════════════════════════
+import pyrogram.errors as _pg_errors
+import pyrogram.raw.functions.phone as _phone_module
+from pyrogram.raw.core import TLObject
+
+
+class _DummyGroupCallError(_pg_errors.BadRequest):
+    pass
+
+
+_MISSING_ERRORS = [
+    "GroupcallForbidden", "GroupCallForbidden",
+    "GroupcallInvalid", "GroupCallInvalid",
+    "GroupcallNotFound", "GroupCallNotFound",
+    "GroupcallAlreadyDiscarded", "GroupCallAlreadyDiscarded",
+    "GroupcallJoinMissing", "GroupCallJoinMissing",
+    "GroupcallNotModified", "GroupCallNotModified",
+    "GroupcallParticipantNotFound", "GroupCallParticipantNotFound",
+    "GroupcallAlreadyJoined", "GroupCallAlreadyJoined",
+]
+for _err_name in _MISSING_ERRORS:
+    if not hasattr(_pg_errors, _err_name):
+        setattr(_pg_errors, _err_name,
+                type(_err_name, (_DummyGroupCallError,), {}))
+
+try:
+    import pyrogram.errors.exceptions.bad_request_400 as _b400
+    for _n in _MISSING_ERRORS:
+        if not hasattr(_b400, _n):
+            setattr(_b400, _n, getattr(_pg_errors, _n))
+except Exception:
+    pass
+
+try:
+    import pyrogram.errors.exceptions.forbidden_403 as _f403
+    for _n in _MISSING_ERRORS:
+        if not hasattr(_f403, _n):
+            setattr(_f403, _n, getattr(_pg_errors, _n))
+except Exception:
+    pass
+
+
+class _StubTLObject(TLObject):
+    ID = 0
+    def __init__(self, *a, **k): pass
+    def write(self): return b""
+    @classmethod
+    def read(cls, *a, **k): return None
+
+
+_MISSING_RAW = {
+    "GetGroupCallChainBlocks": 0xeeee22cc,
+    "CreateConferenceCall": 0x7d0444bb,
+    "GetGroupCallStreamChannels": 0x1ab21940,
+    "GetGroupCallStreamRtmpUrl": 0xc5c1c8f4,
+    "SendGroupCallMessage": 0xee1f9b1f,
+}
+for _name, _id in _MISSING_RAW.items():
+    if not hasattr(_phone_module, _name):
+        setattr(_phone_module, _name,
+                type(_name, (_StubTLObject,), {"ID": _id}))
+
 
 from pyrogram import Client
 from pyrogram.errors import UserAlreadyParticipant, FloodWait
 from pyrogram.raw import functions
-from config import API_ID, API_HASH, SILENT_WAV
+from config import API_ID get, API_HASH, SILENT_fl_WAV
 from database import (
-    all_accounts, mark_joined, has_joined,
-    get_cached_chat_id, cache_chat_id,
+   ood all_accounts, mark_joined,_ has_joined,
+    get_cuntilached_chat_id, cache_chat_id,
     get_flood_until, set_flood_until,
 )
 
 logger = logging.getLogger(__name__)
+logger.info("🔧 Pyrogram GroupCall patches applied")
 
 PyTgCalls = None
 MediaStream = None
@@ -27,6 +92,7 @@ try:
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
+# ── Per-channel session tracking: {key: {phone: block}} ──
 _active_sessions = {}
 _stop_events = {}
 
@@ -90,7 +156,7 @@ async def _drop_dead(phone, err=""):
 
 
 async def _resolve_and_join(app, chat_target, link, phone):
-    flood_until = await get_flood_until(phone)
+    flood_until = await(phone)
     if flood_until > time.time():
         logger.info(f"   ⏳ {phone} flood {int(flood_until-time.time())}s")
         return None
@@ -140,26 +206,26 @@ async def _resolve_and_join(app, chat_target, link, phone):
         return None
 
 
-async def _real_join(call_py, chat_id) -> bool:
+async def _play_unmuted(call_py, chat_id, media_path):
+    """Play silent WAV — this is what actually joins the VC in py-tgcalls."""
     try:
-        stream = MediaStream(SILENT_WAV)
+        stream = MediaStream(media_path)
     except Exception as e:
-        logger.error(f"   MediaStream build failed: {e}")
+        logger.error(f"stream build: {e}")
         return False
-
     try:
         await call_py.play(chat_id, stream)
-        logger.info(f"   ✅ play({chat_id}) OK")
+        try:
+            await call_py.unmute(chat_id)
+        except Exception:
+            pass
         return True
     except Exception as e:
         err = str(e)
-        if "CHAT_ADMIN_REQUIRED" in err:
-            logger.info(f"   🎧 joined as listener ({chat_id})")
+        if "CHAT_ADMIN_REQUIRED" in err or "GROUPCALL_FORBIDDEN" in err.upper():
+            logger.info(f"   🎧 listener-mode join ({chat_id})")
             return True
-        if "GROUPCALL" in err.upper():
-            logger.info(f"   🎧 joined (no mic) ({chat_id})")
-            return True
-        logger.error(f"   play failed: {err[:150]}")
+        logger.error(f"play failed for {chat_id}: {err[:150]}")
         return False
 
 
@@ -183,15 +249,9 @@ async def _join_one(phone, session, chat_target, link="", key=""):
 
         call_py = PyTgCalls(app)
         await call_py.start()
-
-        ok = await _real_join(call_py, chat_id)
-        if not ok:
-            logger.warning(f"⚠️ {phone}: VC join failed on {chat_target}")
-            try: await call_py.leave_call(chat_id)
-            except Exception: pass
-            try: await app.stop()
-            except Exception: pass
-            return None
+        played = await _play_unmuted(call_py, chat_id, SILENT_WAV)
+        if not played:
+            logger.warning(f"{phone}: play failed but staying in VC")
 
         _active_sessions.setdefault(key, {})[phone] = {
             "client": app,
@@ -353,4 +413,3 @@ def active_sessions(key=None):
     for bucket in _active_sessions.values():
         total.update(bucket)
     return total
-PYEOF
