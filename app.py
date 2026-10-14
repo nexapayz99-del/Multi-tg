@@ -14,14 +14,19 @@ def _no_input(prompt=""):
 _builtins.input = _no_input
 # ═══════════════════════════════════════════════════════════
 
-import asyncio, logging
+import asyncio, logging, io, os, time as _time
+from datetime import datetime
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
-from database import users, accounts, auto_channels, all_accounts
+from database import (
+    users, accounts, auto_channels, all_accounts,
+    backup_count, restore_from_backups, export_all_backups,
+    flood_state,
+)
 from quota import (
     reset_daily, has_active_plan, check_quota, get_plan,
     is_banned, is_admin,
@@ -140,7 +145,7 @@ async def _btn_randomize(c, m):
 
 
 # ═══════════════════════════════════════════════════════════
-# STATS — new user-facing stats
+# STATS
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.regex("^📋 Stats$"))
 async def _btn_stats(c, m):
@@ -179,7 +184,7 @@ async def _cmd_globalstats(c, m):
 
 
 # ═══════════════════════════════════════════════════════════
-# MY ACCOUNTS — owner only
+# MY ACCOUNTS
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.regex("^🗂 My Accounts$"))
 async def _btn_myaccts(c, m):
@@ -227,9 +232,9 @@ async def _btn_addchan(c, m):
     c.user_data[uid] = {"step": "channel_link"}
     await m.reply(
         "📺 Send the channel link:\n"
-        "• `@username`\n"
-        "• `https://t.me/username`\n"
-        "• `https://t.me/+invite`")
+        "• `@username` (public)\n"
+        "• `https://t.me/username` (public)\n"
+        "• `https://t.me/+invite` (private)")
 
 
 @bot.on_message(filters.private & filters.regex("^📺 Channels$"))
@@ -243,7 +248,8 @@ async def _btn_channels(c, m):
     txt = f"📺 **Auto Channels** ({len(docs)}/{MAX_AUTO_CHANNELS})\n\n"
     kb = []
     for d in docs:
-        txt += f"• `{d['link']}`\n"
+        icon = "🔒" if ("/+" in d["link"] or "joinchat/" in d["link"]) else "🌐"
+        txt += f"{icon} `{d['link']}`\n"
         kb.append([InlineKeyboardButton(f"🗑 Remove {d['link']}",
                                         callback_data=f"rmch_{d['link']}")])
     await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -263,7 +269,8 @@ async def _btn_joinvc(c, m):
     c.user_data[uid] = {"step": "joinvc_link"}
     await m.reply(
         "🎤 Send the channel link where VC is LIVE:\n\n"
-        "Example: `@unfindmusic`")
+        "• Public: `@channel` or `https://t.me/channel`\n"
+        "• Private: `https://t.me/+invite`")
 
 
 @bot.on_message(filters.private & filters.regex("^🚪 Leave VC$"))
@@ -308,7 +315,6 @@ async def _btn_leavelink(c, m):
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.regex("^💎 My Plan$"))
 async def _btn_myplan(c, m):
-    from datetime import datetime
     p = await get_plan(m.from_user.id)
     if not p or p.get("max_accounts") in (None, 0):
         return await m.reply("💎 **No active plan.** Contact the owner.")
@@ -331,7 +337,7 @@ async def _cmd_myplan(c, m):
 
 
 # ═══════════════════════════════════════════════════════════
-# HEALTH — ADMIN / OWNER ONLY
+# HEALTH
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.regex("^🩺 Health$"))
 async def _btn_health(c, m):
@@ -367,7 +373,7 @@ async def _do_health(c, m):
 
 
 # ═══════════════════════════════════════════════════════════
-# OWNER PANEL BUTTON
+# OWNER PANEL
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.regex("^👑 Owner Panel$"))
 async def _btn_ownerpanel(c, m):
@@ -384,13 +390,128 @@ async def _btn_ownerpanel(c, m):
         [InlineKeyboardButton("📢 Broadcast", callback_data="own_broadcast")],
         [InlineKeyboardButton("🩺 Health Check", callback_data="own_health")],
         [InlineKeyboardButton("🗑 Clean Dead Sessions", callback_data="own_clean")],
+        [InlineKeyboardButton("💾 Backup Info", callback_data="own_backup_info")],
+        [InlineKeyboardButton("♻️ Restore From Backup", callback_data="own_restore")],
+        [InlineKeyboardButton("📤 Export All Sessions", callback_data="own_export")],
+        [InlineKeyboardButton("🧹 Clear Flood State", callback_data="own_clear_flood")],
     ])
     await m.reply("👑 **Owner Panel**\n\nChoose an action:",
                   reply_markup=kb)
 
 
 # ═══════════════════════════════════════════════════════════
-# TEXT INPUT HANDLERS (VC / LINK)
+# OWNER CALLBACKS (backup + extras)
+# ═══════════════════════════════════════════════════════════
+@bot.on_callback_query(filters.regex(r"^own_(backup_info|restore|export|clear_flood)$"))
+async def _owner_backup_cb(c, q):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("👑 Owner only.", show_alert=True)
+
+    action = q.data.replace("own_", "")
+
+    if action == "backup_info":
+        live = await accounts.count_documents({})
+        bk = await backup_count()
+        await q.message.reply(
+            f"💾 **Backup Info**\n\n"
+            f"📱 Live accounts: `{live}`\n"
+            f"🗄 Backup rows: `{bk}`\n\n"
+            f"Every session you import is stored here permanently. "
+            f"If the live table is wiped, press **♻️ Restore From Backup**."
+        )
+        return await q.answer()
+
+    if action == "restore":
+        await q.answer("Restoring…")
+        msg = await q.message.reply("♻️ Restoring from backup…")
+        n = await restore_from_backups()
+        await msg.edit_text(f"♻️ Restored `{n}` account(s) from backup.")
+        return
+
+    if action == "export":
+        await q.answer("Building export…")
+        rows = await export_all_backups()
+        if not rows:
+            return await q.message.reply("📭 No backups yet.")
+
+        buf = io.StringIO()
+        buf.write("# Telegram sessions export\n")
+        buf.write(f"# generated: {datetime.utcnow()}\n")
+        buf.write(f"# count: {len(rows)}\n\n")
+        for r in rows:
+            buf.write(f"# {r['phone']} | {r['name']}\n")
+            buf.write(f"{r['session']}\n\n")
+
+        fname = f"sessions_export_{int(_time.time())}.txt"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(buf.getvalue())
+
+        await q.message.reply_document(
+            fname,
+            caption=f"📤 **{len(rows)} sessions**\n"
+                    f"Re-importable via 📦 Import")
+        try:
+            os.remove(fname)
+        except Exception:
+            pass
+        return
+
+    if action == "clear_flood":
+        await q.answer()
+        r = await flood_state.delete_many({})
+        await q.message.reply(f"🧹 Cleared `{r.deleted_count}` flood entries.")
+
+
+# ═══════════════════════════════════════════════════════════
+# OWNER COMMANDS
+# ═══════════════════════════════════════════════════════════
+@bot.on_message(filters.command("backup") & filters.private)
+async def _cmd_backup(c, m):
+    if m.from_user.id != OWNER_ID:
+        return
+    live = await accounts.count_documents({})
+    bk = await backup_count()
+    await m.reply(f"💾 Live: `{live}` | Backup: `{bk}`")
+
+
+@bot.on_message(filters.command("restore") & filters.private)
+async def _cmd_restore(c, m):
+    if m.from_user.id != OWNER_ID:
+        return
+    n = await restore_from_backups()
+    await m.reply(f"♻️ Restored `{n}` account(s).")
+
+
+@bot.on_message(filters.command("export") & filters.private)
+async def _cmd_export(c, m):
+    if m.from_user.id != OWNER_ID:
+        return
+    rows = await export_all_backups()
+    if not rows:
+        return await m.reply("📭 No backups.")
+    buf = io.StringIO()
+    for r in rows:
+        buf.write(f"# {r['phone']} | {r['name']}\n{r['session']}\n\n")
+    fname = f"sessions_export_{int(_time.time())}.txt"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(buf.getvalue())
+    await m.reply_document(fname, caption=f"📤 {len(rows)} sessions")
+    try:
+        os.remove(fname)
+    except Exception:
+        pass
+
+
+@bot.on_message(filters.command("clearflood") & filters.private)
+async def _cmd_clearflood(c, m):
+    if m.from_user.id != OWNER_ID:
+        return
+    r = await flood_state.delete_many({})
+    await m.reply(f"🧹 Cleared `{r.deleted_count}` flood entries.")
+
+
+# ═══════════════════════════════════════════════════════════
+# TEXT INPUT HANDLERS
 # ═══════════════════════════════════════════════════════════
 @bot.on_message(filters.private & filters.text, group=5)
 async def _text_states(c, m):
@@ -436,7 +557,8 @@ async def _daily_reset():
 
 async def _run():
     ensure_silent()
-    log.info(f"🤖 Starting bot | OWNER_ID={OWNER_ID} | Pool MAX={auto_worker.MAX_POOL}")
+    log.info(f"🤖 Starting bot | OWNER_ID={OWNER_ID} | "
+             f"Pool MAX={auto_worker.MAX_POOL}")
     await bot.start()
     log.info("🤖 Bot started")
     asyncio.create_task(auto_worker.auto_watcher_loop())
