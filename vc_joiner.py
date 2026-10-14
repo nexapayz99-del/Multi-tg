@@ -2,10 +2,11 @@
 import asyncio, uuid, os, wave, logging, time
 
 # ═══════════════════════════════════════════════════════════════
-# Pyrogram patches — must come BEFORE pytgcalls imports
+# Pyrogram patches — MUST run before pytgcalls uses raw types
 # ═══════════════════════════════════════════════════════════════
 import pyrogram.errors as _pg_errors
 import pyrogram.raw.functions.phone as _phone_module
+import pyrogram.raw.types as _raw_types
 from pyrogram.raw.core import TLObject
 
 
@@ -40,27 +41,61 @@ except Exception:
     pass
 
 
+# ── Stub TLObject base ──
 class _StubTLObject(TLObject):
     ID = 0
-    def __init__(self, *a, **k): pass
+    def __init__(self, *a, **k):
+        # accept anything, store as attrs
+        for i, v in enumerate(a):
+            setattr(self, f"_arg{i}", v)
+        for k_, v in k.items():
+            setattr(self, k_, v)
     def write(self): return b""
     @classmethod
     def read(cls, *a, **k): return None
 
 
-# ── Every TL function Pyrogram 2.0.106 lacks that pytgcalls needs ──
+# ═══════════════════════════════════════════════════════════════
+# 1. Patch missing RAW TYPES (pyrogram.raw.types)
+# ═══════════════════════════════════════════════════════════════
+_MISSING_TYPES = {
+    # name: TL ID (hex)
+    "InputGroupCallInviteMessage":       0x2b95d4e2,
+    "InputGroupCallStream":              0x05962a4b,
+    "GroupCallParticipantVideo":         0x67753ac8,
+    "GroupCallParticipantVideoSource":   0xa04c05c5,
+    "GroupCallStreamChannel":            0x80eb48af,
+    "InputGroupCallSlug":                0xfe06823f,
+    "InputGroupCallInviteMessageByLink": 0x8e5e0e5c,
+    "InputGroupCall":                    0xd8aa840f,  # safety
+}
+for _name, _id in _MISSING_TYPES.items():
+    if not hasattr(_raw_types, _name):
+        setattr(_raw_types, _name,
+                type(_name, (_StubTLObject,), {"ID": _id}))
+
+# Also add to parent raw module for good measure
+import pyrogram.raw as _raw_parent
+for _name, _id in _MISSING_TYPES.items():
+    if not hasattr(_raw_parent, _name):
+        setattr(_raw_parent, _name,
+                type(_name, (_StubTLObject,), {"ID": _id}))
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. Patch missing RAW FUNCTIONS (pyrogram.raw.functions.phone)
+# ═══════════════════════════════════════════════════════════════
 _MISSING_RAW = {
     "GetGroupCallChainBlocks":              0xeeee22cc,
     "CreateConferenceCall":                 0x7d0444bb,
     "GetGroupCallStreamChannels":           0x1ab21940,
     "GetGroupCallStreamRtmpUrl":            0xc5c1c8f4,
     "SendGroupCallMessage":                 0xee1f9b1f,
-    "SendGroupCallEncryptedMessage":        0xf5f1e4b1,   # ← key one
+    "SendGroupCallEncryptedMessage":        0xf5f1e4b1,
     "InviteConferenceCallParticipant":      0x4b6d4b8a,
-    "SendConferenceCallBroadcast":          0xc9b7fbd3,   # ← key one
+    "SendConferenceCallBroadcast":          0xc9b7fbd3,
     "DeleteConferenceCallParticipants":     0x8ca60525,
     "GetGroupCallJoinAs":                   0xef7c213a,
-    "GetGroupCall":                         0x041845db,
     "JoinGroupCall":                        0xb132ff7b,
     "LeaveGroupCall":                       0x500377f9,
     "EditGroupCallParticipant":             0xa5273abf,
@@ -71,36 +106,27 @@ _MISSING_RAW = {
     "StartGroupCallScreenSharing":          0x6e2b19ee,
     "ToggleGroupCallSettings":              0x2191c008,
     "DiscardGroupCall":                     0x7a777135,
-    "GetGroupCallStreams":                  0xad89fcb1,  # alt name
 }
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_phone_module, _name):
         setattr(_phone_module, _name,
                 type(_name, (_StubTLObject,), {"ID": _id}))
-        logger_missing = True  # marker
 
+# Mirror under pyrogram.raw.functions
 import pyrogram.raw.functions as _raw_funcs
-# Also stub under the parent module (some pytgcalls versions import from there)
 for _name, _id in _MISSING_RAW.items():
     if not hasattr(_raw_funcs, _name):
         setattr(_raw_funcs, _name,
                 type(_name, (_StubTLObject,), {"ID": _id}))
 
-# ── Patches done ──
-
-from pyrogram import Client
-from pyrogram.errors import UserAlreadyParticipant, FloodWait
-from pyrogram.raw import functions
-from config import API_ID, API_HASH, SILENT_WAV
-from database import (
-    all_accounts, mark_joined, has_joined,
-    get_cached_chat_id, cache_chat_id,
-    get_flood_until, set_flood_until,
-)
-
 logger = logging.getLogger(__name__)
-logger.info("🔧 Pyrogram GroupCall patches applied")
+logger.info("🔧 Pyrogram GroupCall patches applied "
+            "(types + functions)")
 
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Import pytgcalls AFTER patches
+# ═══════════════════════════════════════════════════════════════
 PyTgCalls = None
 MediaStream = None
 PYTGCALLS_OK = False
@@ -112,13 +138,24 @@ try:
 except Exception as e:
     logger.error(f"❌ PyTgCalls unavailable: {e}")
 
+
+from pyrogram import Client
+from pyrogram.errors import UserAlreadyParticipant, FloodWait
+from pyrogram.raw import functions
+from config import API_ID, API_HASH, SILENT_WAV
+from database import (
+    all_accounts, mark_joined, has_joined,
+    get_cached_chat_id, cache_chat_id,
+    get_flood_until, set_flood_until,
+)
+
 _active_sessions = {}
 _stop_events = {}
 
 # Batch tuning
-VC_BATCH_SIZE   = 5      # joins at a time
-VC_BATCH_DELAY  = 3      # seconds between batches
-VC_JOIN_DELAY   = 1      # seconds between accounts within a batch
+VC_BATCH_SIZE  = 5      # joins at a time
+VC_BATCH_DELAY = 3      # seconds between batches
+VC_JOIN_DELAY  = 1      # delay inside a batch (per worker)
 
 # ⚠ Only TRUE session-death markers
 DEAD_MARKERS = (
@@ -194,25 +231,23 @@ async def _play_unmuted(call_py, chat_id, media_path):
 
 async def _resolve_and_join(app, chat_target, link, phone):
     """
-    Resolve chat, join if needed. Respects flood_until. Returns chat.id or None.
+    Resolve chat, join if needed. Respects flood_until.
+    Returns chat.id or None.
     """
-    # Flood guard
     flood_until = await get_flood_until(phone)
-    now = time.time()
-    if flood_until and flood_until > now:
-        logger.info(f"   ⏳ {phone} flood for {int(flood_until-now)}s — skipping")
+    if flood_until > time.time():
+        logger.info(f"   ⏳ {phone} flood for "
+                    f"{int(flood_until-time.time())}s — skip")
         return None
 
     is_private = _is_private_link(link)
 
-    # If we know this account already joined, use cached chat_id
-    if is_private:
-        if await has_joined(link, phone):
-            cached_id, _ = await get_cached_chat_id(link)
-            if cached_id:
-                return cached_id
+    if is_private and await has_joined(link, phone):
+        cached_id, _ = await get_cached_chat_id(link)
+        if cached_id:
+            return cached_id
 
-    # Fresh resolve
+    # Direct resolve
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
@@ -226,7 +261,7 @@ async def _resolve_and_join(app, chat_target, link, phone):
             await _drop_dead(phone, err)
             return None
 
-    # Try join once (only reachable if not already joined)
+    # Join
     try:
         await app.join_chat(chat_target)
         logger.info(f"   ✅ {phone} joined {chat_target}")
@@ -235,7 +270,7 @@ async def _resolve_and_join(app, chat_target, link, phone):
     except FloodWait as fw:
         until = time.time() + fw.value
         await set_flood_until(phone, until)
-        logger.warning(f"   ⚠️ {phone} FLOOD_WAIT {fw.value}s — will skip until then")
+        logger.warning(f"   ⚠️ {phone} FLOOD_WAIT {fw.value}s — skip until then")
         return None
     except Exception as e:
         err = str(e)
@@ -244,7 +279,7 @@ async def _resolve_and_join(app, chat_target, link, phone):
             return None
         logger.debug(f"   join failed {phone}: {err[:80]}")
 
-    # Resolve again
+    # Post-join resolve
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
@@ -316,14 +351,8 @@ async def leave_all():
         await leave_one(ph)
 
 
-# ═══════════════════════════════════════════════════════════════
-# BATCH JOIN WORKER
-# ═══════════════════════════════════════════════════════════════
 async def _join_batch(accs, chat_target, link, stop_event):
-    """
-    Join a single batch of accounts in parallel.
-    Returns (ok, failed).
-    """
+    """Join a batch — all 5 in parallel."""
     tasks = []
     for acc in accs:
         if stop_event.is_set():
@@ -336,13 +365,13 @@ async def _join_batch(accs, chat_target, link, stop_event):
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     ok = sum(1 for r in results if isinstance(r, int))
-    fail = len(tasks) - ok
-    return ok, fail
+    return ok, len(tasks) - ok
 
 
 async def auto_vc_worker(key, chat_target, stop_event,
                          max_accounts=None, is_private=False):
-    if not PYTGCALLS_OK: return
+    if not PYTGCALLS_OK:
+        return
     ensure_silent()
     _stop_events[key] = stop_event
     joined = False
@@ -367,8 +396,8 @@ async def auto_vc_worker(key, chat_target, stop_event,
                     session_string=probe["session"],
                     in_memory=True, no_updates=True,
                 ) as pc:
-                    cid = await _resolve_and_join(pc, chat_target, chat_target,
-                                                  probe["phone"])
+                    cid = await _resolve_and_join(pc, chat_target,
+                                                  chat_target, probe["phone"])
                     if cid:
                         live = await is_vc_live(pc, cid)
                     logger.info(f"🎤 probe {chat_target}: live={live}")
