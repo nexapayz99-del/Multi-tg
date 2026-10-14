@@ -19,7 +19,6 @@ sessions_seen  = db["sessions_seen"]
 settings       = db["settings"]
 banned_users   = db["banned_users"]
 
-# Fernet for session encryption
 _fernet = Fernet(SESSION_KEY) if SESSION_KEY else None
 
 
@@ -66,3 +65,44 @@ async def all_accounts(limit=5000):
         if d.get("session"):
             d["session"] = decrypt_session(d["session"])
     return docs
+
+
+# ═══════════════════════════════════════════════════════════════
+# PRIVATE-CHANNEL JOIN TRACKING
+# ═══════════════════════════════════════════════════════════════
+async def mark_joined(link: str, phone: str):
+    """Remember that `phone` successfully joined the channel at `link`."""
+    await auto_channels.update_one(
+        {"link": link},
+        {"$addToSet": {"joined_accounts": phone}},
+        upsert=False,
+    )
+
+
+async def has_joined(link: str, phone: str) -> bool:
+    doc = await auto_channels.find_one(
+        {"link": link, "joined_accounts": phone},
+        {"_id": 1},
+    )
+    return bool(doc)
+
+
+async def get_joined_set(link: str) -> set:
+    doc = await auto_channels.find_one({"link": link},
+                                       {"joined_accounts": 1})
+    return set(doc.get("joined_accounts", [])) if doc else set()
+
+
+async def get_cached_chat_id(link: str):
+    doc = await auto_channels.find_one({"link": link}, {"chat_id": 1, "title": 1})
+    if doc and doc.get("chat_id"):
+        return doc["chat_id"], doc.get("title")
+    return None, None
+
+
+async def cache_chat_id(link: str, chat_id: int, title: str = ""):
+    await auto_channels.update_one(
+        {"link": link},
+        {"$set": {"chat_id": chat_id, "title": title or ""}},
+        upsert=False,
+    )
