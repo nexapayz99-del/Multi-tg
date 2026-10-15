@@ -1,7 +1,5 @@
 cat > ~/Multi-tg/vc_joiner.py << 'ENDOFFILE'
-"""vc_joiner.py — public + private VC join as silent listeners.
-py-tgcalls 3.0.0 + pyrogram 2.0.106 with sitecustomize block=/public_key= wrapper.
-"""
+"""vc_joiner.py — public + private VC join as silent listeners."""
 import asyncio, uuid, os, wave, logging, time
 
 import pyrogram.errors as _pg_errors
@@ -109,7 +107,6 @@ def _is_private_link(link):
 
 
 def ensure_silent():
-    """Generate a 60-second silent WAV so pytgcalls keeps the stream alive."""
     try:
         if os.path.exists(SILENT_WAV) and os.path.getsize(SILENT_WAV) > 5_000_000:
             return
@@ -226,6 +223,9 @@ async def _play_unmuted(call_py, chat_id, media_path):
         if "CHAT_ADMIN_REQUIRED" in err or "GROUPCALL_FORBIDDEN" in err.upper():
             logger.info(f"   listener-mode join ({chat_id})")
             return True
+        if "PEER_ID_INVALID" in err or "Peer id invalid" in err:
+            logger.info(f"   peer not cached ({chat_id})")
+            return True
         logger.error(f"play failed for {chat_id}: {err[:150]}")
         return False
 
@@ -249,6 +249,24 @@ async def _join_one(phone, session, chat_target, link="", key=""):
             except Exception:
                 pass
             return None
+
+        # ── Warm up peer cache so pytgcalls can resolve the ID ──
+        try:
+            await app.get_chat(chat_id)
+        except Exception:
+            pass
+        try:
+            await app.resolve_peer(chat_id)
+        except Exception:
+            pass
+        try:
+            await app.get_chat(chat_target)
+        except Exception:
+            pass
+        try:
+            await app.resolve_peer(chat_target)
+        except Exception:
+            pass
 
         call_py = PyTgCalls(app)
         await call_py.start()
@@ -295,7 +313,6 @@ async def leave_one(phone, key=""):
 
 
 async def leave_all(key=""):
-    """Staggered leave in batches of 5 to avoid connection reset storms."""
     if key:
         bucket = _active_sessions.get(key, {})
         phones = list(bucket.keys())
@@ -371,7 +388,6 @@ async def auto_vc_worker(key, chat_target, stop_event,
                 ) as pc:
                     cid = None
                     if is_private:
-                        # join the CHANNEL (not the VC) so get_chat works
                         try:
                             await pc.join_chat(chat_target)
                         except Exception:
