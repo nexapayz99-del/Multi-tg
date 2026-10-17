@@ -162,16 +162,29 @@ async def _resolve_and_join(app, chat_target, link, phone):
 
     is_private = _is_private_link(link)
 
-    if is_private and await has_joined(link, phone):
-        cached_id, _ = await get_cached_chat_id(link)
-        if cached_id:
-            return cached_id
+    # Use cached chat_id if we already resolved this channel
+    cached_id, _ = await get_cached_chat_id(link)
+    if cached_id:
+        if is_private and not await has_joined(link, phone):
+            try:
+                await app.join_chat(chat_target)
+            except UserAlreadyParticipant:
+                pass
+            except FloodWait as fw:
+                await set_flood_until(phone, time.time() + fw.value)
+                logger.warning(f"   {phone} FLOOD_WAIT {fw.value}s")
+                return None
+            except Exception:
+                pass
+            await mark_joined(link, phone)
+        return cached_id
 
+    # First time: resolve, cache, remember
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
+        await cache_chat_id(link, cid, getattr(chat, "title", ""))
         if is_private:
-            await cache_chat_id(link, cid, getattr(chat, "title", ""))
             await mark_joined(link, phone)
         return cid
     except Exception as e:
@@ -197,8 +210,7 @@ async def _resolve_and_join(app, chat_target, link, phone):
     try:
         chat = await app.get_chat(chat_target)
         cid = chat.id
-        if is_private:
-            await cache_chat_id(link, cid, getattr(chat, "title", ""))
+        await cache_chat_id(link, cid, getattr(chat, "title", ""))
         await mark_joined(link, phone)
         return cid
     except Exception:
@@ -250,21 +262,9 @@ async def _join_one(phone, session, chat_target, link="", key=""):
                 pass
             return None
 
-        # ── Warm up peer cache so pytgcalls can resolve the ID ──
-        try:
-            await app.get_chat(chat_id)
-        except Exception:
-            pass
+        # Only ONE resolve_peer, no get_chat, no GetFullChannel
         try:
             await app.resolve_peer(chat_id)
-        except Exception:
-            pass
-        try:
-            await app.get_chat(chat_target)
-        except Exception:
-            pass
-        try:
-            await app.resolve_peer(chat_target)
         except Exception:
             pass
 
@@ -387,7 +387,10 @@ async def auto_vc_worker(key, chat_target, stop_event,
                     in_memory=True, no_updates=True,
                 ) as pc:
                     cid = None
-                    if is_private:
+                    cached_id, _ = await get_cached_chat_id(chat_target)
+                    if cached_id:
+                        cid = cached_id
+                    elif is_private:
                         try:
                             await pc.join_chat(chat_target)
                         except Exception:
@@ -404,6 +407,8 @@ async def auto_vc_worker(key, chat_target, stop_event,
                         try:
                             chat = await pc.get_chat(chat_target)
                             cid = chat.id
+                            await cache_chat_id(chat_target, cid,
+                                                getattr(chat, "title", ""))
                         except Exception:
                             cid = None
 
