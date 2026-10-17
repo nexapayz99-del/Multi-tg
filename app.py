@@ -1,3 +1,4 @@
+cat > ~/Multi-tg/app.py << 'ENDOFFILE'
 # ═══════════════════════════════════════════════════════════
 # BLOCK PYROGRAM INTERACTIVE INPUT
 # ═══════════════════════════════════════════════════════════
@@ -57,13 +58,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# Silence Pyrogram's chatty logs
+# Silence Pyrogram + pytgcalls chatty logs
 for _noisy in (
     "pyrogram.session.session", "pyrogram.connection.connection",
     "pyrogram.session.auth", "pyrogram.crypto.aes",
-    "pytgcalls",
 ):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+logging.getLogger("pytgcalls").setLevel(logging.ERROR)
 
 log = logging.getLogger("bot")
 
@@ -595,3 +597,4 @@ async def _run():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(_run())
+ENDOFFILE
