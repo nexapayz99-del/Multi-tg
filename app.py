@@ -58,7 +58,19 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# Silence Pyrogram + pytgcalls chatty logs
+
+# ═══════════════════════════════════════════════════════════
+# Log noise suppression
+# ═══════════════════════════════════════════════════════════
+class _FloodFilter(logging.Filter):
+    """Suppress the noisy GetFullChannel rate-limit warnings."""
+    def filter(self, record):
+        msg = record.getMessage()
+        if "GetFullChannel" in msg and "Waiting for" in msg:
+            return False
+        return True
+
+
 for _noisy in (
     "pyrogram.session.session", "pyrogram.connection.connection",
     "pyrogram.session.auth", "pyrogram.crypto.aes",
@@ -66,6 +78,8 @@ for _noisy in (
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logging.getLogger("pytgcalls").setLevel(logging.ERROR)
+logging.getLogger("pyrogram.session.session").addFilter(_FloodFilter())
+# ═══════════════════════════════════════════════════════════
 
 log = logging.getLogger("bot")
 
